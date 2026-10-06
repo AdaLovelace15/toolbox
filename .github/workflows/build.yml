@@ -89,6 +89,15 @@ jobs:
         if: github.event_name == 'pull_request'
         run: bash tests/docs-consistency.sh
 
+      # The host-side ./toolbox wrapper on a real docker host: up, the cluster
+      # switch, status, reauth refusals and down - with throwaway names and an
+      # unreachable domain, so no login is involved.
+      - name: Host smoke test
+        if: github.event_name == 'pull_request'
+        env:
+          TOOLBOX_IMAGE: toolbox:ci
+        run: bash tests/host-smoke.sh
+
       # The deploy helpers' logic (source positions, diffs, watch states, PR
       # naming) against fakes - no server, no network.
       - name: Unit tests

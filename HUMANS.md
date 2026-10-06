@@ -394,6 +394,28 @@ server-side and keeps it off the command line.
 Built for `linux/amd64` and `linux/arm64`, so Apple Silicon is native — no
 emulation, no Rosetta.
 
+The host side, `./toolbox`, needs bash, the docker CLI and a docker daemon on
+the same machine: `up` bind-mounts your working directory and CA bundle, so a
+remote `DOCKER_HOST` or SSH docker context can't work. `propose` also needs
+`git` and `gh`. `tests/host-smoke.sh` checks a machine in a few minutes, with
+no login and throwaway names: `bash tests/host-smoke.sh`.
+
+| Host | Status |
+|---|---|
+| Linux, Docker Engine | Tested; the smoke test runs in CI |
+| A codespace or devcontainer using the host's docker | Tested — works when the workspace is at the same path on the docker host |
+| Windows: WSL2 (Ubuntu 24.04) with Docker Engine inside it | Tested: the smoke test, from the Linux filesystem and from `/mnt/c`, and a real login |
+| macOS: Docker Desktop, Colima, OrbStack | Expected to work (bash 3.2, BSD tools); not yet tested |
+| Linux, rootless Docker | Expected to work; not yet tested |
+| Windows: WSL2 with Docker Desktop | Expected to work; not yet tested |
+| Podman through its `docker` alias | Unknown |
+| Windows: Git Bash, PowerShell, cmd | Not supported — use WSL2 |
+| Remote docker daemons | Not supported |
+
+**On Windows, clone inside WSL**, or with `core.autocrlf=false`. This repo's
+`.gitattributes` keeps the scripts' line endings LF either way; a script with
+CRLF fails with `/usr/bin/env: 'bash\r': No such file or directory`.
+
 ## Releases
 
 Tagged with [release-please](https://github.com/googleapis/release-please) from
