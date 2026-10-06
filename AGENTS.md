@@ -107,6 +107,10 @@ exactly what it couldn't do.
 
 Its last lines say what happened. The cases:
 
+- **`Windows shells (Git Bash, MSYS, Cygwin) aren't supported`** — you are
+  running natively on Windows. The toolbox only runs inside WSL2. Run nothing
+  else; tell the human to start their agent inside WSL and clone there
+  ([HUMANS.md](HUMANS.md#windows)).
 - **`docker is not installed`** / **`cannot connect to the docker daemon`** and
   you are not root — you need docker, or a user that can reach it. Nothing in
   this repo can fix that; tell the human.

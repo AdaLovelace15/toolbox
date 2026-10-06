@@ -69,8 +69,9 @@ reason to run it. If the human only suspects the login is broken, run `./toolbox
 means the failure is something else — report it, and offer `reauth`. `up` for a
 different domain also wipes the old login.
 
-`up` handles the environment itself — starting dockerd, proxies, CAs, host
-networking — and prints what it decided. Don't investigate any of that first; if
+On Windows, the toolbox and you must run inside WSL2; if `up` says Windows
+shells aren't supported, say so and stop. `up` handles the environment itself —
+starting dockerd, proxies, CAs, host networking — and prints what it decided. Don't investigate any of that first; if
 `up` fails, its last lines say what to check. Everything else is in
 [AGENTS.md](AGENTS.md). The rules above always apply; AGENTS.md has the
 details, and what to do if a step fails.

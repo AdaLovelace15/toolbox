@@ -20,3 +20,6 @@ and changes go through pull requests to the deployment repo.
   Start at the top: it is the complete happy path.
 - **Humans** — **[HUMANS.md](HUMANS.md)**: setup, the commands, configuration,
   how it works, known risks, building and releases.
+
+Runs on Linux, and on Windows inside WSL2 (both tested); macOS is expected to
+work but untested — see [Platforms](HUMANS.md#platforms).
