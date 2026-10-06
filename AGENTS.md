@@ -80,6 +80,12 @@ Its last lines say what happened. The cases:
   it found. If it fails, the error tells you what's wrong.
 - **Don't run the container by hand** with `docker run -it`. You have no TTY, and
   `up` already made the decisions a bare `docker run` would get wrong.
+- **Don't delete or modify data.** These credentials can write well beyond what
+  the commands suggest — including into Loki, Thanos and Tempo through Grafana's
+  datasource proxy, durably and with no audit trail (see
+  [HUMANS.md](HUMANS.md#known-risks)). Query, inspect and report: no
+  `bao kv delete`/`destroy`, no Grafana `DELETE` calls, no pushes to any
+  datasource. If a task seems to need a destructive action, stop and ask.
 
 Get the login URL in front of the human as fast as you can — the code expires five
 minutes after it is issued, and every command you run first eats into that. Step 1
@@ -313,6 +319,19 @@ compared with plain `argocd app manifests <app>` using `dyff`, and polling
 
 `bao kv put` replaces the whole secret — keys you don't pass are dropped from the
 new version. Use `patch` to change one field, or read the secret first.
+
+### Metrics, logs and traces — reading
+
+All three go through Grafana's datasource proxy; the wrappers add the
+credentials and the server address.
+
+| | |
+|---|---|
+| `promtool query instant '<promql>'` | a metric now (Thanos), including alert state via `ALERTS` |
+| `promtool query range --start … --end … '<promql>'` | a metric over time. `query series`/`labels` and `debug` are refused: they can't authenticate |
+| `logcli query '<logql>'` | logs (Loki); `--since 1h`, `--limit`, `--tail` |
+| `tempo-cli query api search …` / `trace-id <id>` | traces (Tempo, TraceQL). `--use-grpc` is refused |
+| `grafana-ds <prometheus\|loki\|tempo>` | a datasource UID; the wrappers use it, you rarely need to |
 
 ### Checking before you act
 

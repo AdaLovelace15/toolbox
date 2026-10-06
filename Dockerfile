@@ -122,7 +122,7 @@ RUN chmod +x /usr/local/bin/toolbox-token /usr/local/bin/toolbox-proxy \
 # fails. Deliberately no VOLUME directive: it would create a fresh anonymous
 # volume on every `docker run`, so the cache would never survive a restart and
 # developers would re-authenticate every time. Persistence is opt-in, by mounting
-# a named volume over this path (see README).
+# a named volume over this path (see HUMANS.md).
 RUN useradd -m -u 1000 -s /bin/bash toolbox \
  && mkdir -p /home/toolbox/.config/glueops \
  && printf '. /etc/toolbox-env.sh\n' >> /home/toolbox/.bashrc \

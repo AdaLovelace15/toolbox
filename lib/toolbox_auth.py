@@ -27,7 +27,7 @@ EXPIRY_SKEW = 60
 def _env(name, default=None, required=False):
     v = os.environ.get(name, default)
     if required and not v:
-        sys.exit(f"toolbox: {name} is not set (see README)")
+        sys.exit(f"toolbox: {name} is not set (see HUMANS.md)")
     return v
 
 
