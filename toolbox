@@ -294,7 +294,7 @@ cmd_exec() {
     # can see it (the workdir is mounted at the same path), so relative paths
     # work; a container without the mount just stays in its home directory.
     set +e
-    docker exec "${tty[@]}" "$NAME" bash -lc 'cd "$1" 2>/dev/null; shift; exec "$@"' bash "$(pwd -P)" "$@"
+    docker exec ${tty[@]+"${tty[@]}"} "$NAME" bash -lc 'cd "$1" 2>/dev/null; shift; exec "$@"' bash "$(pwd -P)" "$@"
     rc=$?
     set -e
     if [ "$rc" = 127 ]; then
@@ -307,37 +307,101 @@ cmd_exec() {
 # git and gh run here, on the host, with the human's credentials; the container
 # (which sees the clone through the read-only mount) works out the branch name,
 # the affected ArgoCD apps and the PR body, and has ArgoCD render the pushed
-# branch. The one rule this enforces: nothing is ever committed to, pushed to or
-# merged into the branch the apps track.
+# branch. The one rule this enforces: nothing is ever committed to, pushed to
+# or merged into a branch an ArgoCD app tracks. Pushes name the full refspec, so
+# push.default, remote.<name>.push and upstream settings cannot redirect them.
+#
+# Exit: 0 PR opened or updated, 1 usage or environment, 2 failed (nothing
+# opened), 3 ArgoCD renders no change (nothing opened).
 
-# Next free branch name: name, name-2, name-3...
+valid_branch() {
+    case "$1" in ""|-*|+*|*:*) return 1 ;; esac
+    git check-ref-format --branch "$1" >/dev/null 2>&1
+}
+
+# Is $1 one of the remaining arguments?
+in_list() {
+    local x=$1; shift
+    local y
+    for y in "$@"; do [ "$x" = "$y" ] && return 0; done
+    return 1
+}
+
+# Next branch name free locally and on origin: name, name-2, name-3...
 free_branch() {
-    local repo=$1 want=$2 b=$2 n=1
-    while git -C "$repo" show-ref --verify --quiet "refs/heads/$b" \
-          || git -C "$repo" ls-remote --exit-code --heads origin "$b" >/dev/null 2>&1; do
+    local repo=$1 want=$2 b=$2 n=1 rc
+    while :; do
+        if ! git -C "$repo" show-ref --verify --quiet "refs/heads/$b"; then
+            rc=0; git -C "$repo" ls-remote --exit-code --heads origin "refs/heads/$b" >/dev/null 2>&1 || rc=$?
+            case "$rc" in
+                2) break ;;
+                0) ;;
+                *) die "cannot reach origin to check branch names (git ls-remote exit $rc)" ;;
+            esac
+        fi
         n=$((n + 1)); b="$want-$n"
     done
     printf '%s' "$b"
 }
 
-# Push, have the container write the body (running preflight per app), open the PR.
-propose_publish() {  # repo repo_p base branch title intent [revert-sha]
-    local repo=$1 repo_p=$2 base=$3 branch=$4 title=$5 intent=$6 revert=${7:-}
-    local sha body rc=0 url
-    [ "$branch" != "$base" ] || die "refusing to push to $base"
-    git -C "$repo" push -q -u origin "$branch" || die "git push failed"
+# The remote's default branch, asked of the remote itself (a local origin/HEAD
+# goes stale when the default is renamed).
+remote_default() {
+    local repo=$1 b
+    b=$(git -C "$repo" ls-remote --symref origin HEAD 2>/dev/null | sed -n 's|^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$|\1|p')
+    [ -n "$b" ] || b=$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    b=${b#origin/}
+    printf '%s' "${b:-main}"
+}
+
+# Push one branch to the same name on origin, and nothing else.
+push_branch() {  # repo branch tracked...
+    local repo=$1 branch=$2; shift 2
+    valid_branch "$branch" || die "refusing to push a branch named '$branch'"
+    if in_list "$branch" "$@"; then die "refusing to push $branch: ArgoCD apps deploy from it"; fi
+    local guards=() t before after
+    for t in "$@"; do guards+=("refs/heads/$t"); done
+    before=$(git -C "$repo" ls-remote origin "${guards[@]}")
+    git -C "$repo" push -q origin "refs/heads/$branch:refs/heads/$branch" || die "git push of $branch failed"
+    after=$(git -C "$repo" ls-remote origin "${guards[@]}")
+    [ "$before" = "$after" ] || die "a tracked branch on origin changed during the push - check $* on origin now"
+    git -C "$repo" branch -q --set-upstream-to "origin/$branch" "$branch" >/dev/null 2>&1 || true
+}
+
+# Push, have the container write the body (running preflight per app), then open
+# the PR - or update it, when this branch already has one open.
+propose_publish() {  # repo repo_p base branch title intent revert marker_app marker_env tracked...
+    local repo=$1 repo_p=$2 base=$3 branch=$4 title=$5 intent=$6 revert=$7 mapp=$8 menv=$9
+    shift 9
+    local sha body rc=0 url others needle
+    push_branch "$repo" "$branch" "$@"
     sha=$(git -C "$repo" rev-parse HEAD)
     body=$(cmd_exec toolbox-propose body --repo-root "$repo_p" --base "origin/$base" \
-               --rev "$sha" -m "$intent" ${revert:+--revert-of "$revert"}) || rc=$?
+               --rev "$sha" --message="$intent" ${revert:+--revert-of "$revert"}) || rc=$?
+    case "$rc" in
+        1) case "$body" in *"### What changes"*) ;; *) rc=2 ;; esac ;;
+    esac
     case "$rc" in
         1) ;;
-        0) log "ArgoCD renders no change for any app: branch $branch is pushed, no PR opened"; return 0 ;;
-        *) log "preflight failed (see above): branch $branch is pushed, no PR opened"; return 2 ;;
+        0) log "ArgoCD renders no change for any app: branch $branch is pushed, no PR opened"; return 3 ;;
+        *) log "preflight failed (see above): branch $branch is pushed, no PR opened; you are on $branch"; return 2 ;;
     esac
-    url=$(cd "$repo" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$body") \
-        || die "gh pr create failed; branch $branch is pushed"
+    if [ -n "$mapp" ]; then
+        needle="glueops-deploy:{\"app\":\"$mapp\",\"env\":\"$menv\","
+        others=$(cd "$repo" && gh pr list --state open --limit 100 --json number,headRefName,body \
+            --jq ".[] | select(.headRefName != \"$branch\") | select(.body | contains(\"${needle//\"/\\\"}\")) | \"#\\(.number)\"" 2>/dev/null | tr '\n' ' ')
+        [ -z "$others" ] || log "open deploy PRs for $mapp [$menv]: ${others}- the repo's cleanup workflow closes the older ones when this opens"
+    fi
+    url=$(cd "$repo" && gh pr list --state open --head "$branch" --json url --jq '.[0].url // empty' 2>/dev/null || true)
+    if [ -n "$url" ]; then
+        (cd "$repo" && gh pr edit "$url" --title "$title" --body "$body" >/dev/null) || die "gh pr edit failed; branch $branch is pushed"
+        log "updated the open PR for $branch"
+    else
+        url=$(cd "$repo" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$body") \
+            || die "gh pr create failed; branch $branch is pushed"
+    fi
     printf '%s\n' "$url"
-    log "next: give the human that link and stop. Nothing deploys until they merge it; then: ./toolbox toolbox-watch <app> --rev <merge-sha>"
+    log "next: give the human that link and stop - nothing deploys until they merge it. After the merge: git fetch, then ./toolbox toolbox-watch <app> --rev \$(gh pr view $url --json mergeCommit --jq .mergeCommit.oid) for each app above"
 }
 
 cmd_propose() {
@@ -345,6 +409,7 @@ cmd_propose() {
     while [ $# -gt 0 ]; do
         case "$1" in
             -m|--message) [ $# -ge 2 ] || die "propose: -m needs a value"; intent=$2; shift 2 ;;
+            --message=*)  intent=${1#--message=}; shift ;;
             --repo)       [ $# -ge 2 ] || die "propose: --repo needs a value"; dir=$2; shift 2 ;;
             --revert)     [ $# -ge 2 ] || die "propose: --revert needs a commit"; revert=$2; shift 2 ;;
             *) die "usage: toolbox propose -m <intent> [--repo DIR] | toolbox propose --revert <merge-sha> [-m <reason>] [--repo DIR]" ;;
@@ -352,56 +417,77 @@ cmd_propose() {
     done
     command -v gh >/dev/null 2>&1 || die "propose needs the GitHub CLI (gh) on this host"
     gh auth status >/dev/null 2>&1 || die "gh is not logged in: gh auth login"
-    local repo repo_p base
+    local repo repo_p base cur k v
     repo=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) \
         || die "$dir is not in a git repository; cd into the deployment repo clone or pass --repo"
     repo_p=$(cd "$repo" && pwd -P)
     is_inside "$repo_p" "$(container_workdir)" \
         || die "$repo_p is outside the toolbox's mounted workdir ($(container_workdir)); run ./toolbox up from a directory that contains it"
-    base=$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
-    base=${base#origin/}; base=${base:-main}
-    git -C "$repo" fetch -q origin "$base" || die "git fetch origin $base failed"
+    base=$(remote_default "$repo")
+    git -C "$repo" fetch -q origin "+refs/heads/$base:refs/remotes/origin/$base" || die "git fetch origin $base failed"
+    cur=$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null) || die "detached HEAD; check out a branch first"
 
     if [ -n "$revert" ]; then
-        local sha subject branch m=()
-        sha=$(git -C "$repo" rev-parse --verify --quiet "$revert^{commit}") || die "unknown commit $revert"
+        local sha branch subject out m=() tracked=() tr
+        tr=$(cmd_exec toolbox-propose tracked --repo-root "$repo_p" --base "origin/$base") || exit 2
+        while IFS='=' read -r k v; do if [ "$k" = tracked ]; then tracked+=("$v"); fi; done <<< "$tr"
+        in_list "$base" ${tracked[@]+"${tracked[@]}"} || tracked+=("$base")
+        sha=$(git -C "$repo" rev-parse --verify --quiet "$revert^{commit}") || die "unknown commit $revert (git fetch first?)"
         git -C "$repo" merge-base --is-ancestor "$sha" "origin/$base" || die "$revert is not on $base"
         [ -z "$(git -C "$repo" status --porcelain)" ] || die "the working tree has changes; commit or stash them first"
         branch=$(free_branch "$repo" "revert/$(git -C "$repo" rev-parse --short "$sha")")
-        git -C "$repo" switch -q -c "$branch" "origin/$base"
+        git -C "$repo" switch -q --no-track -c "$branch" "origin/$base"
         # A merge commit needs a mainline; the PR's merge is reverted against its first parent.
-        [ "$(git -C "$repo" rev-list --parents -n1 "$sha" | wc -w)" -gt 2 ] && m=(-m 1)
-        if ! git -C "$repo" revert --no-edit ${m[@]+"${m[@]}"} "$sha" >/dev/null; then
+        if [ "$(git -C "$repo" rev-list --parents -n1 "$sha" | wc -w)" -gt 2 ]; then m=(-m 1); fi
+        if ! out=$(git -C "$repo" revert --no-edit ${m[@]+"${m[@]}"} "$sha" 2>&1); then
             git -C "$repo" revert --abort >/dev/null 2>&1 || true
-            die "git revert of $revert conflicts; resolve it by hand on a branch"
+            git -C "$repo" switch -q "$cur" && git -C "$repo" branch -q -D "$branch"
+            case "$out" in
+                *"nothing to commit"*|*"nothing added to commit"*) die "reverting $revert changes nothing on $base - is it already reverted?" ;;
+                *) die "git revert of $revert conflicts with later commits on $base; it needs a hand-made revert. You are back on $cur" ;;
+            esac
         fi
         subject=$(git -C "$repo" log -1 --format=%s)
-        propose_publish "$repo" "$repo_p" "$base" "$branch" "$subject" "${intent:-Reverts $sha.}" "$sha"
+        propose_publish "$repo" "$repo_p" "$base" "$branch" "$subject" "${intent:-Reverts $sha.}" "$sha" "" "" "${tracked[@]}"
         return
     fi
 
     [ -n "$intent" ] || die "propose: say what the change is for: -m \"<intent>\""
-    local cur plan branch="" title="" k v
-    cur=$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null) || die "detached HEAD; check out a branch first"
-    plan=$(cmd_exec toolbox-propose plan --repo-root "$repo_p" --base "origin/$base" \
-               --branch "$cur" -m "$intent") || exit 2
+    local plan branch="" title="" mapp="" menv="" files=() tracked=() apps=""
+    plan=$(cmd_exec toolbox-propose plan --repo-root "$repo_p" --base "origin/$base" --message="$intent") || exit 2
     while IFS='=' read -r k v; do
-        case "$k" in branch) branch=$v ;; title) title=$v ;; apps) log "affected: $v" ;; esac
+        case "$k" in
+            branch) branch=$v ;; title) title=$v ;; marker_app) mapp=$v ;; marker_env) menv=$v ;;
+            file) files+=("$v") ;; tracked) tracked+=("$v") ;; app) apps="$apps $v" ;;
+        esac
     done <<< "$plan"
-    [ -n "$branch" ] && [ -n "$title" ] || die "could not work out a branch and title"
+    [ -n "$branch" ] && [ -n "$title" ] && [ "${#files[@]}" -gt 0 ] || die "could not work out a branch, title and files"
+    in_list "$base" ${tracked[@]+"${tracked[@]}"} || tracked+=("$base")
+    log "affected:$apps"
 
-    if [ "$cur" = "$base" ]; then
+    if in_list "$cur" "${tracked[@]}"; then
+        # On a branch ArgoCD deploys from: start a fresh branch from origin, carrying the edits.
+        local ahead
+        git -C "$repo" fetch -q origin "+refs/heads/$cur:refs/remotes/origin/$cur" || die "git fetch origin $cur failed"
+        ahead=$(git -C "$repo" rev-list --count "origin/$cur..HEAD")
+        [ "$ahead" = 0 ] || die "$cur has $ahead local commit(s) not on origin; move them to a branch (git switch -c <name>) and run propose from there"
         branch=$(free_branch "$repo" "$branch")
-        git -C "$repo" switch -q -c "$branch"
+        valid_branch "$branch" || die "could not make a valid branch name from '$branch'"
+        git -C "$repo" switch -q --no-track -c "$branch" "origin/$base" \
+            || die "your edits conflict with newer commits on $base: git pull --ff-only, then run again"
     else
+        local up
+        up=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name "@{upstream}" 2>/dev/null || true)
+        [ -z "$up" ] || [ "$up" = "origin/$cur" ] || die "$cur tracks $up; propose only pushes a branch to its own name - start a new branch"
         branch=$cur
     fi
-    if [ -n "$(git -C "$repo" status --porcelain)" ]; then
-        git -C "$repo" add -A
-        git -C "$repo" commit -q -m "$title"
+    # Only the files ArgoCD apps read - never whatever else is lying in the clone.
+    git -C "$repo" add -- "${files[@]}"
+    if ! git -C "$repo" diff --cached --quiet -- "${files[@]}"; then
+        git -C "$repo" commit -q -m "$title" -- "${files[@]}"
     fi
     [ "$(git -C "$repo" rev-list --count "origin/$base..HEAD")" -gt 0 ] || die "nothing to propose: $branch has no commits beyond $base"
-    propose_publish "$repo" "$repo_p" "$base" "$branch" "$title" "$intent"
+    propose_publish "$repo" "$repo_p" "$base" "$branch" "$title" "$intent" "" "$mapp" "$menv" "${tracked[@]}"
 }
 
 cmd_status() {

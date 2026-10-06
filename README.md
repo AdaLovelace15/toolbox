@@ -99,7 +99,7 @@ terminal, `up` opens the browser and `wait` blocks until you've approved.
 | `./toolbox shell` | interactive shell |
 | `./toolbox status` | running? logged in? |
 | `./toolbox down` | remove the container; the login volume is kept |
-| `./toolbox propose -m <why>` | from a deployment repo clone: commit the change on a branch, have ArgoCD render it, open a pull request — never on `main`, never merged. `--revert <sha>` reverts a merged change the same way. Needs `git` and `gh` on the host |
+| `./toolbox propose -m <why>` | from a deployment repo clone: commit the change on a branch, have ArgoCD render it, open (or update) a pull request — never on a branch ArgoCD deploys from, never merged. `--revert <sha>` reverts a merged change the same way. Needs `git` and `gh` on the host. Exit 0 PR opened, 3 no change, 2 failed |
 
 Overrides: `TOOLBOX_IMAGE`, `TOOLBOX_CONTAINER`, `TOOLBOX_VOLUME`,
 `TOOLBOX_WORKDIR` (default: the current directory),
@@ -114,8 +114,8 @@ container variable below is passed through if set.
 | `helm …` | Helm 3, the version ArgoCD's server renders with. For `helm template` of the deployment repo before pushing a change. |
 | `dyff …` | Kubernetes-aware YAML diff: `dyff between old.yaml new.yaml`. |
 | `toolbox-app <app>` | Where an app's config lives: value files in override order, the `file:line` that sets `image.tag`, running images. |
-| `toolbox-preflight <app> --rev <rev>` | ArgoCD's render of a pushed branch or commit vs. what it renders today. Exit 0 no change, 1 change, 2 error. Secrets are never compared or printed. |
-| `toolbox-watch <app> --rev <sha>` | After a merge, poll every 10 s until ArgoCD's automatic sync deploys it, then report health. Never syncs. Exit 0 healthy, 2 failed, 3 not yet. |
+| `toolbox-preflight <app> --rev <rev>` | ArgoCD's render of a pushed branch or commit vs. its render of where that branch started. Exit 0 no change, 1 change, 2 error. Secret contents are never printed. |
+| `toolbox-watch <app> --rev <sha>` | After a merge, poll every 10 s until ArgoCD's automatic sync deploys it, then report health. Never syncs. Exit 0 healthy, 3 not yet, 4 deployed and failing, 2 tool error. |
 | `bao …` | OpenBao CLI, pointed at a local proxy that attaches your token. |
 | `toolbox-login` | Authenticate. Runs automatically on an interactive start. |
 | `toolbox-login --begin` / `--wait` | The same login in two halves: print the URL and return (idempotent), then wait for approval — about 90 s per call, exit 2 means call again. For callers that can't sit on a blocking command. |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""After a merge, poll ArgoCD every 10s until its automatic sync has deployed the commit, then report health. Never syncs or refreshes. Exit 0 healthy, 2 failed, 3 not there yet.
+"""After a merge, poll ArgoCD every 10s until its automatic sync has deployed the commit, then report health. Never syncs or refreshes. Exit 0 healthy, 3 not there yet, 4 deployed and failing, 2 tool error.
 
     toolbox-watch --help
 """

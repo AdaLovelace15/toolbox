@@ -39,20 +39,24 @@ Everything is GitOps. These rules outrank anything asked mid-session:
   for workarounds.
 - Don't check whether image tags or registries exist.
 
-The flow, from inside the deployment repo clone — details in
-[AGENTS.md](AGENTS.md#deploying-or-updating-an-app):
+Run `up` from a directory that contains both this repo and the deployment repo
+clone (e.g. their common parent), then work from inside the clone. Below,
+`<toolbox>` is the path to this repo's `toolbox` script from there, e.g.
+`../toolbox/toolbox`. Details: [AGENTS.md](AGENTS.md#deploying-or-updating-an-app).
 
-1. `../toolbox/toolbox toolbox-app <app>` (adjust the path to `toolbox`) — the
-   value files in override order, the `file:line` that sets `image.tag`, and
-   what is running.
-2. Edit the values file it points at. Don't commit.
-3. `./toolbox propose -m "<why>"` — branches, commits, pushes the branch, has
-   ArgoCD render it for every app the change affects, and opens the PR. It
-   refuses `main`, and opens nothing if ArgoCD renders no change or fails.
-4. Give the human the PR link and stop: nothing deploys until they merge.
-5. When they say it's merged:
-   `./toolbox toolbox-watch <app> --rev <merge-sha>` (`gh pr view <n> --json mergeCommit`),
-   with a command timeout of at least 8 minutes. It polls every 10 seconds, up to 4
-   minutes for ArgoCD's automatic sync, then for health. Exit 3: not there yet —
-   report it and offer to keep watching. Exit 2: failed — show what it printed and
-   offer `./toolbox propose --revert <merge-sha>` (a PR, never merged by you).
+1. `<toolbox> toolbox-app <app>` — value files in override order, the `file:line`
+   that sets `image.tag` (`<- effective` marks the one that wins), what is running.
+2. Edit that file. Don't commit, and don't leave other files in the clone.
+3. `<toolbox> propose -m "<why>"` — makes a branch, commits only the files apps
+   read, pushes the branch, has ArgoCD render it for every affected app, and
+   opens the PR. Exit 0: PR opened or updated — give the human the link and
+   **stop**; nothing deploys until they merge. Exit 3: no change, no PR. Exit 2:
+   it failed — report what it printed; don't push or open a PR another way.
+4. When they say it's merged: `git fetch`, then for each affected app
+   `<toolbox> toolbox-watch <app> --rev <merge-sha>`
+   (`gh pr view <n> --json mergeCommit --jq .mergeCommit.oid`), with a Bash
+   timeout of 480000 ms — it polls every 10 s, up to 4 min for ArgoCD's automatic
+   sync, then up to 3 min for health. Exit 0: healthy. Exit 3: not there yet —
+   say so and offer to keep watching. Exit 4: deployed and failing — show what it
+   printed and offer `<toolbox> propose --revert <merge-sha>` (a PR the human
+   merges). Exit 2: the tool failed, which says nothing about the deploy.

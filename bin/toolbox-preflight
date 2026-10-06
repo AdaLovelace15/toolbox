@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Have ArgoCD render a pushed branch or commit of the deployment repo and compare it with what it renders today. Read-only. Exit 0 no change, 1 change, 2 error.
+"""Have ArgoCD render a pushed branch or commit of the deployment repo and compare it with its render of where that branch started. Read-only. Exit 0 no change, 1 change, 2 error.
 
     toolbox-preflight --help
 """
