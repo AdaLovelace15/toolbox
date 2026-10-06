@@ -10,7 +10,8 @@
 #   toolbox shell                 interactive shell in the container
 #   toolbox status                is it running, is it logged in
 #   toolbox down                  remove the container (the login cache volume is kept)
-#   toolbox reauth [<domain>]     forget the login entirely and sign in again from scratch
+#   toolbox reauth [<domain>]     wipe the login (container + volume) and sign in again;
+#                                 same cluster unless one is named
 #   toolbox propose -m <intent>   commit the deployment repo change on a branch, have
 #                                 ArgoCD render it, open a PR, stop (never main, never merge)
 #   toolbox propose --revert <sha>  the same, reverting a merged change
@@ -20,9 +21,9 @@
 # same path, and commands start in your current directory, so helm can render a
 # deployment-configurations clone that lives under it.
 #
-# One cluster at a time: `up` for a different captain domain removes the
-# container and the login volume first, so nothing from the old cluster's
-# login survives.
+# One cluster at a time: the login volume records its cluster, and `up` for a
+# different captain domain removes the container and that volume first - even
+# after `down`. Only volumes the toolbox created are ever removed.
 # ---
 #
 # `up` deals with the environment so nobody has to: starts dockerd if it is
@@ -34,8 +35,15 @@ set -euo pipefail
 
 IMAGE="${TOOLBOX_IMAGE:-ghcr.io/glueops/toolbox:latest}"
 NAME="${TOOLBOX_CONTAINER:-toolbox}"
-VOLUME="${TOOLBOX_VOLUME:-glueops-toolbox}"
+# Each container gets its own login volume, so two containers (two clusters)
+# never share - and never wipe - one login. `toolbox` keeps the historic name.
+if [ "$NAME" = toolbox ]; then VOLUME="${TOOLBOX_VOLUME:-glueops-toolbox}"
+else VOLUME="${TOOLBOX_VOLUME:-glueops-$NAME}"; fi
 WORKDIR_LABEL=dev.glueops.toolbox.workdir
+# Set on the login volumes `up` creates: only those are ever deleted, and the
+# cluster label says which cluster the login inside belongs to.
+LOGIN_LABEL=dev.glueops.toolbox.login
+CLUSTER_LABEL=dev.glueops.toolbox.cluster
 DOMAIN=""
 WORKDIR=""
 
@@ -65,7 +73,8 @@ is_inside() {  # $1 path, $2 directory
 }
 
 container_workdir() {
-    docker inspect -f "{{index .Config.Labels \"$WORKDIR_LABEL\"}}" "$NAME" 2>/dev/null || true
+    docker container inspect -f "{{index .Config.Labels \"$WORKDIR_LABEL\"}}" "$NAME" 2>/dev/null \
+        | sed 's/^<no value>$//' || true
 }
 
 # ---------------------------------------------------------------- docker ----
@@ -218,13 +227,13 @@ login() {
             fi ;;
         *)
             if agent_mode; then
-                log "next: give the beta heads-up (rule 1) if you haven't this conversation, then run: ./toolbox <command>"
+                log "next: give the beta heads-up (rule 1) if you haven't this conversation, then run: ./toolbox <command>. Only if the human asked to log in again, as someone else or to another cluster: ./toolbox reauth [<captain-domain>]"
             fi ;;
     esac
 }
 
 container_env() {  # $1 = variable name; empty when there is no container
-    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
         | sed -n "s/^$1=//p" || true
 }
 container_domain() { container_env TOOLBOX_CAPTAIN_DOMAIN; }
@@ -266,18 +275,61 @@ check_gate() {
         || log "WARNING: this image predates the beta gate, so the observability CLIs are NOT switched off: docker pull $IMAGE && ./toolbox down && ./toolbox up <domain>"
 }
 
-# Remove the container and the login volume: every token and half-finished login.
+# The bare captain domain - what people paste varies (https://, a path, a
+# trailing dot, capitals) and must not read as a different cluster.
+normalise_domain() {
+    local d=$1
+    d=${d#*://}; d=${d%%/*}; d=${d%.}
+    d=$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')
+    case "$d" in ""|.*|*..*|*[!a-z0-9.-]*) return 1 ;; esac
+    printf '%s' "$d"
+}
+
+volume_exists() { docker volume inspect "$1" >/dev/null 2>&1; }
+volume_label() {  # volume, label
+    docker volume inspect -f "{{index .Labels \"$2\"}}" "$1" 2>/dev/null | sed 's/^<no value>$//' || true
+}
+# A volume `up` created, or the unlabelled default every earlier version used.
+volume_is_ours() { [ "$(volume_label "$1" "$LOGIN_LABEL")" = 1 ] || [ "$1" = glueops-toolbox ]; }
+# The login volume the container actually mounts - it may predate TOOLBOX_VOLUME.
+container_volume() {
+    docker container inspect -f '{{range .Mounts}}{{if eq .Destination "/home/toolbox/.config/glueops"}}{{.Name}}{{end}}{{end}}' "$NAME" 2>/dev/null || true
+}
+ensure_volume() {
+    volume_exists "$VOLUME" \
+        || docker volume create --label "$LOGIN_LABEL=1" --label "$CLUSTER_LABEL=$DOMAIN" "$VOLUME" >/dev/null
+}
+
+# Remove the container and its login volume(s): every cached token and
+# half-finished login. Never a volume the toolbox didn't create.
 forget_everything() {
-    docker rm -f "$NAME" >/dev/null 2>&1 || true
-    if docker volume inspect "$VOLUME" >/dev/null 2>&1; then
-        docker volume rm "$VOLUME" >/dev/null \
-            || die "could not remove the login volume $VOLUME (is another container using it? docker ps -a --filter volume=$VOLUME)"
+    local vols=() v removed=""
+    v=$(container_volume)
+    if [ -n "$v" ]; then vols+=("$v"); fi
+    if [ "$v" != "$VOLUME" ]; then vols+=("$VOLUME"); fi
+    for v in "${vols[@]}"; do
+        if volume_exists "$v" && ! volume_is_ours "$v"; then
+            die "refusing to remove volume $v: it isn't a toolbox login volume. Point TOOLBOX_VOLUME at the toolbox's own, or remove it yourself"
+        fi
+    done
+    if docker container inspect "$NAME" >/dev/null 2>&1; then
+        docker rm -f "$NAME" >/dev/null
+        removed="container $NAME"
     fi
+    for v in "${vols[@]}"; do
+        volume_exists "$v" || continue
+        docker volume rm "$v" >/dev/null \
+            || die "could not remove the login volume $v - is another container using it? (docker ps -a --filter volume=$v) Free it, then run this again"
+        removed="${removed:+$removed, }volume $v"
+    done
+    log "removed: ${removed:-nothing - there was no container or login volume}"
 }
 
 cmd_up() {
-    DOMAIN="${1:-${TOOLBOX_CAPTAIN_DOMAIN:-}}"
-    [ -n "$DOMAIN" ] || die "usage: toolbox up <captain-domain>   (e.g. prod.foobar.onglueops.com)"
+    local raw="${1:-${TOOLBOX_CAPTAIN_DOMAIN:-}}"
+    [ -n "$raw" ] || die "usage: toolbox up <captain-domain>   (e.g. prod.foobar.onglueops.com)"
+    DOMAIN=$(normalise_domain "$raw") || die "'$raw' isn't a captain domain (e.g. prod.foobar.onglueops.com)"
+    [ "$DOMAIN" = "$raw" ] || log "captain domain: $DOMAIN (from '$raw')"
     # The observability opt-in is for a human at a terminal, never for an agent.
     if agent_mode && [ "$(obs_mode "${TOOLBOX_ENABLE_OBSERVABILITY:-}")" = on ]; then
         log "TOOLBOX_ENABLE_OBSERVABILITY is ignored when driven by an agent; a human must run up from a terminal"
@@ -287,12 +339,34 @@ cmd_up() {
     resolve_workdir
     need_docker
 
-    if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
+    # One cluster at a time. The container (running or not) and the login volume
+    # each record their cluster; a login for any other is removed before anything
+    # starts - including after `down`, when only the volume is left.
+    local had vol_had
+    had=$(normalise_domain "$(container_domain)" || true)
+    vol_had=$(volume_label "$VOLUME" "$CLUSTER_LABEL")
+    if [ -n "$had" ] && [ "$had" != "$DOMAIN" ]; then
+        log "switching cluster: $had -> $DOMAIN; removing the old container and its login"
+        forget_everything
+    elif volume_exists "$VOLUME" && [ "$vol_had" != "$DOMAIN" ]; then
+        if [ -n "$vol_had" ]; then
+            log "switching cluster: $vol_had -> $DOMAIN; removing the old login"
+            forget_everything
+        elif volume_is_ours "$VOLUME"; then
+            log "the login volume $VOLUME predates cluster tracking; removing it (a one-time sign-in after this upgrade)"
+            forget_everything
+        else
+            log "volume $VOLUME records no cluster and isn't one the toolbox created; leaving it (a login in it for another cluster is discarded on first use)"
+        fi
+    fi
+
+    if [ "$(docker container inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
         local mounted
         mounted=$(container_workdir)
-        if [ "$(container_domain)" != "$DOMAIN" ]; then
-            log "switching cluster: $(container_domain) -> $DOMAIN; removing the old container and its login"
-            forget_everything
+        if [ "$(container_env TOOLBOX_DEX_URL)" != "${TOOLBOX_DEX_URL:-}" ] \
+           || [ "$(container_env TOOLBOX_CLIENT_ID)" != "${TOOLBOX_CLIENT_ID:-}" ]; then
+            # Same domain, another Dex or client: env is fixed at creation.
+            log "running container has a different TOOLBOX_DEX_URL or TOOLBOX_CLIENT_ID; recreating it"
         elif ! is_inside "$WORKDIR" "$mounted"; then
             # Mounts are fixed at creation. The login lives in the volume, so
             # recreating costs nothing but any command running in it right now.
@@ -306,12 +380,6 @@ cmd_up() {
             login; return
         fi
     fi
-    local old
-    old=$(container_domain)
-    if [ -n "$old" ] && [ "$old" != "$DOMAIN" ]; then
-        log "switching cluster: $old -> $DOMAIN; removing the old container and its login"
-        forget_everything
-    fi
     log "workdir: $WORKDIR (read-only)"
     docker rm -f "$NAME" >/dev/null 2>&1 || true
 
@@ -320,6 +388,7 @@ cmd_up() {
         docker pull -q "$IMAGE" >/dev/null
     fi
 
+    ensure_volume
     local net=bridge rc
     proxy_is_loopback && net=host
     run_container "$net"
@@ -585,19 +654,31 @@ cmd_propose() {
 
 # Sign in again from scratch: no cached token, refresh token, half-finished
 # login or OpenBao token survives. Same cluster unless a domain is given.
+# Everything that could fail is checked before anything is deleted.
 cmd_reauth() {
+    [ $# -le 1 ] || die "usage: toolbox reauth [<captain-domain>]"
     need_docker
-    local domain="${1:-$(container_domain)}"
-    domain="${domain:-${TOOLBOX_CAPTAIN_DOMAIN:-}}"
-    [ -n "$domain" ] || die "usage: toolbox reauth <captain-domain>   (no container to take it from)"
-    log "re-authenticating to $domain: removing the container and the login volume"
+    local raw="${1:-}" domain w
+    raw="${raw:-$(container_domain)}"
+    raw="${raw:-$(volume_label "$VOLUME" "$CLUSTER_LABEL")}"
+    raw="${raw:-${TOOLBOX_CAPTAIN_DOMAIN:-}}"
+    [ -n "$raw" ] || die "usage: toolbox reauth <captain-domain>   (no container or login volume says which cluster)"
+    domain=$(normalise_domain "$raw") || die "'$raw' isn't a captain domain (e.g. prod.foobar.onglueops.com)"
+    # Keep the mount the old container had, unless told otherwise.
+    if [ -z "${TOOLBOX_WORKDIR:-}" ]; then
+        w=$(container_workdir)
+        if [ -n "$w" ]; then TOOLBOX_WORKDIR=$w; fi
+    fi
+    resolve_workdir
+    log "re-authenticating to $domain: removing container $NAME and its login volume (cached Dex, refresh and OpenBao tokens)"
+    log "to sign in as someone else, open the new URL in a private window, or sign out of GitHub first"
     forget_everything
     cmd_up "$domain"
 }
 
 cmd_status() {
     local st
-    st=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo "absent")
+    st=$(docker container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo "absent")
     printf 'container: %s' "$st"
     [ "$st" = running ] && printf ' (%s)' "$(container_domain)"
     printf '\n'
@@ -608,6 +689,7 @@ cmd_status() {
             echo "login: not authenticated - run 'toolbox up <domain>' for a URL"
         fi
         echo "observability: $(obs_mode "$(container_env TOOLBOX_ENABLE_OBSERVABILITY)")"
+        echo "login volume: $(container_volume) ($(volume_label "$(container_volume)" "$CLUSTER_LABEL"))"
         check_gate
         log "BETA - argocd and bao only; see HUMANS.md#beta-and-risk-acceptance (agents: ./toolbox rules)"
     fi

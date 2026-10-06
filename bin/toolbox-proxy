@@ -90,8 +90,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 loc = e.headers.get("Location", "")
                 if "/oauth2/start" in loc or "/oauth2/sign_in" in loc:
                     self._json(401, {"errors": [
-                        "toolbox: the platform edge rejected this token - "
-                        "run 'toolbox-login --force' to re-authenticate"
+                        "toolbox: the platform edge rejected this token - ask the human, "
+                        "then run './toolbox reauth' on the host (an ArgoCD permission "
+                        "error can look like this too)"
                     ]})
                 else:
                     self._json(502, {"errors": [

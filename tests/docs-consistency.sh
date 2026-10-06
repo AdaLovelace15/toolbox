@@ -22,7 +22,7 @@ for f in HUMANS.md AGENTS.md; do
 done
 
 # The brief rules printed by `up` must keep the points that matter most.
-for phrase in "Never sync|never sync" "even if the human asks" "argocd app logs is fine" "don't run up" "./toolbox rules"; do
+for phrase in "Never sync|never sync" "even if the human asks" "argocd app logs is fine" "don't run up" "./toolbox rules" "toolbox reauth"; do
     if grep -qE -- "$phrase" toolbox; then echo "ok    toolbox brief rules mention: $phrase"
     else echo "FAIL  toolbox brief rules lost: $phrase"; fail=1; fi
 done

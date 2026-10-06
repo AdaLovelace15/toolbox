@@ -137,29 +137,44 @@ def cluster_id():
     return {"dex": dex_url(), "client_id": client_id()}
 
 
-def forget_login(reason=None):
-    """Remove the cached login and any half-finished one."""
-    for p in (cache_path(), pending_path()):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
-    if reason:
-        log(f"toolbox: {reason}")
+def forget_bao():
+    """Remove the OpenBao token, which belongs to whoever logged in last."""
+    try:
+        os.remove(bao_token_path())
+    except OSError:
+        pass
 
 
 def _read_cache():
     try:
         with open(cache_path()) as f:
+            ino = os.fstat(f.fileno()).st_ino
             obj = json.load(f)
     except (OSError, ValueError):
         return {}
     if not isinstance(obj, dict) or not obj:
         return {}
-    if obj.get("cluster") != cluster_id():
-        forget_login(f"the cached login is not for {dex_url()}; discarded it - sign in again")
-        return {}
-    return obj
+    had = obj.get("cluster")
+    if had == cluster_id():
+        return obj
+    # Not ours: never use it. Delete it only if it is still the file just read -
+    # the proxy, toolbox-token and --wait share this cache, and another of them
+    # may have written a fresh login since. A pending code has its own check.
+    try:
+        if os.stat(cache_path()).st_ino == ino:
+            os.remove(cache_path())
+    except OSError:
+        pass
+    if not isinstance(had, dict):
+        log("toolbox: the cached login is from an older toolbox that didn't record its "
+            "cluster; discarded it once - approve the new URL to sign in")
+    elif had.get("dex") != dex_url():
+        log(f"toolbox: the cached login was for {had.get('dex')}, not {dex_url()}; "
+            "discarded it - approve the new URL to sign in")
+    else:
+        log(f"toolbox: the cached login was for client {had.get('client_id')}, not "
+            f"{client_id()}; discarded it - approve the new URL to sign in")
+    return {}
 
 
 def _write_private_json(path, obj):

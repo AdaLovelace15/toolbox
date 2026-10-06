@@ -115,12 +115,17 @@ against a small public endpoint — not your cluster, which may be slow or priva
 networking; a TLS failure there means an interception CA the host doesn't have,
 and it says so. It prints each decision.
 
-**One cluster at a time.** A login is cached in the `glueops-toolbox` volume and
-records which cluster (Dex issuer and client) it belongs to. `up` for a different
-captain domain removes the container and the volume before starting, so no token
-from the old cluster survives; a cached login for another cluster - or one cached
-before logins recorded their cluster - is discarded and you sign in again.
-`./toolbox reauth` does the same removal on demand.
+**One cluster at a time.** The login lives in a volume (`glueops-toolbox`, or
+`glueops-<container>` with `TOOLBOX_CONTAINER`) that `up` labels with its cluster;
+the login inside also records its Dex issuer and client. `up` for a different
+captain domain — even after `down`, with no container left — removes the
+container and that volume before starting, so no token from the old cluster
+survives. `https://`, a trailing `/` or `.`, and capitals don't count as a
+different domain. `./toolbox reauth` does the same removal on demand. Only
+volumes the toolbox created are ever removed; and inside the container, a cached
+login for another cluster is discarded rather than used, as a backstop. After
+upgrading to this version everyone signs in once more: logins cached before did
+not record their cluster.
 
 `up` also mounts the directory it was run from — or `TOOLBOX_WORKDIR` —
 read-only at the same path inside the container, and every `./toolbox <command>`
@@ -142,7 +147,7 @@ terminal, `up` opens the browser and `wait` blocks until you've approved.
 | `./toolbox shell` | interactive shell |
 | `./toolbox status` | running? logged in? |
 | `./toolbox down` | remove the container; the login volume is kept |
-| `./toolbox reauth [<domain>]` | forget the login entirely - remove the container and the login volume - and run `up` from scratch. The same cluster unless you name another |
+| `./toolbox reauth [<domain>]` | forget the login entirely — remove the container and its login volume — and run `up` from scratch. The same cluster unless you name another. To sign in as someone else, open the new URL in a private window or sign out of GitHub first |
 | `./toolbox rules` | the agent rules for the beta, in full ([AGENT-RULES.md](AGENT-RULES.md)) |
 | `./toolbox propose -m <why>` | from a deployment repo clone: commit the change on a branch, have ArgoCD render it, open (or update) a pull request — never on a branch ArgoCD deploys from, never merged. `--revert <sha>` reverts a merged change the same way. Needs `git` and `gh` on the host. Exit 0 PR opened, 3 no change, 2 failed |
 

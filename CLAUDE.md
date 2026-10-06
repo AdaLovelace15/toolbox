@@ -61,10 +61,10 @@ the code expires in five minutes — then, in the same turn:
 
 If `wait` says `still waiting` (exit 2), run it again. Every later command is
 `./toolbox <command>`: `./toolbox bao kv list secret/`, `./toolbox argocd app get x`.
-Asked to log in again, as someone else, or to another cluster?
-`./toolbox reauth [<captain-domain>]` wipes the login and starts over; show its URL
-and `wait` as above. One cluster at a time: `up` for a new domain wipes the old
-login by itself.
+Asked to log in again, as someone else, or to another cluster? Run
+`./toolbox reauth [<captain-domain>]`: it wipes the cached login and starts over.
+Show its URL and `wait` as above. Only when asked - a failed command is not a
+reason to run it. `up` for a different domain also wipes the old login.
 
 `up` handles the environment itself — starting dockerd, proxies, CAs, host
 networking — and prints what it decided. Don't investigate any of that first; if

@@ -76,6 +76,13 @@ there is nothing to approve; go straight to step 2.
 ./toolbox wait && ./toolbox argocd app list
 ```
 
+**Logging in again.** Asked to log in again, as someone else, or to another
+cluster? `./toolbox reauth [<captain-domain>]` removes the container and its login
+volume — every cached token and half-finished login — and runs `up` from scratch:
+show the new URL, then `./toolbox wait`. To sign in as someone else, the human
+opens the URL in a private window or signs out of GitHub first. The toolbox serves
+one cluster at a time; `up` for a different domain does the same removal by itself.
+
 `wait` returns after about 90 seconds if the human hasn't approved yet, so it
 fits under your tool's command timeout: exit code 2 and `still waiting` mean run
 it again, nothing is wrong. Once approved it logs you into OpenBao too. Every
@@ -115,11 +122,8 @@ Its last lines say what happened. The cases:
   too, no container flag will change it.
 - **`the code expired`** or **`login access_denied`** from `wait` — run
   `./toolbox up <domain>` again and show the new URL.
-- **Asked to log in again, as someone else, or to another cluster** —
-  `./toolbox reauth [<captain-domain>]`. It removes the container and the login
-  volume (every cached token and half-finished login) and runs `up` from scratch:
-  show the new URL, then `./toolbox wait`. The toolbox serves one cluster at a
-  time, and `up` for a different domain does the same removal by itself.
+- **Asked to log in again, as someone else, or to another cluster?** That's not a
+  failure — see "Logging in again" under [Start here](#start-here).
 
 ## Do not
 
@@ -138,6 +142,13 @@ Its last lines say what happened. The cases:
   no calls to Grafana at all (Rule 2), no pushes to any datasource, and
   `bao kv delete`/`destroy` only after the human confirms that exact path. If a
   task seems to need any other destructive action, stop and ask.
+
+- **Don't run `./toolbox reauth` unless the human asked** to log in again, as
+  someone else, or to another cluster. It never fixes `still waiting` (run `wait`
+  again), an expired code (run `up` again), an expired token (it refreshes by
+  itself), `403 permission denied`, or argocd's `unexpected EOF` (usually
+  permissions, not your login — see [HUMANS.md](HUMANS.md#known-issues)). Report
+  those instead.
 
 Get the login URL in front of the human as fast as you can — the code expires five
 minutes after it is issued, and every command you run first eats into that. Step 1
@@ -203,9 +214,10 @@ what sources `/etc/toolbox-env.sh` and configures the CLIs. If you ever bypass
 the wrapper, it has to be `docker exec toolbox bash -lc '...'` — a bare
 `docker exec toolbox argocd app list` will not work.
 
-**`Already authenticated.`** with no URL means the cached volume still holds a
-valid token. Skip to the command. Codes expire after five minutes; if one lapses,
-rerun `toolbox-login --begin`, show the new URL, then `--wait` again.
+**`Already authenticated.`** with no URL means the volume still holds a valid
+token for this cluster. Skip to the command. If a code lapses, run
+`./toolbox up <domain>` again and show the new URL. If the human wanted a fresh
+login, `./toolbox reauth`.
 
 ## Commands
 
@@ -401,7 +413,7 @@ non-zero as "check which", not as "there is drift".
 - **`TOOLBOX_BAO_ROLES=reader` constrains you** to read and list, enforced
   server-side — writes return `403 permission denied`. Worth setting on the run
   command when you know the task is read-only, so a mistake cannot land.
-- **Clean up with `./toolbox down`**; it keeps the volume, which holds the login (for this cluster),
-  so the human isn't asked to approve again next time. (An abandoned container
+- **Clean up with `./toolbox down`**; it keeps the volume, which holds this
+  cluster's login, so the human isn't asked to approve again next time. (An abandoned container
   stops itself after four hours — `TOOLBOX_IDLE_SECONDS` — but don't rely on
   that.)
