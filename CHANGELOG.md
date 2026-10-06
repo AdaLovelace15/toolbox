@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.0.8](https://github.com/GlueOps/toolbox/compare/v0.0.7...v0.0.8) (2026-10-06)
+
+
+### Features
+
+* mark the toolbox beta and switch off the observability CLIs ([#35](https://github.com/GlueOps/toolbox/issues/35)) ([2905b02](https://github.com/GlueOps/toolbox/commit/2905b026edd127187ba8cda9734f5d39bb4103af))
+* one cluster at a time - wipe the login on a cluster change, add reauth (everyone signs in once more after upgrading) ([9faa7e6](https://github.com/GlueOps/toolbox/commit/9faa7e6293a9c0f58a568ee22c164bafa597e8d4))
+* platform-aware messages for agents on Linux, Windows (WSL2) and macOS ([#39](https://github.com/GlueOps/toolbox/issues/39)) ([496d5ce](https://github.com/GlueOps/toolbox/commit/496d5ce2d528713d220a15c83530ab5ab1c00612))
+* read-only argocd, helm and dyff, and a workdir mount for GitOps deploys ([#31](https://github.com/GlueOps/toolbox/issues/31)) ([1dacdc1](https://github.com/GlueOps/toolbox/commit/1dacdc123a5a26f56ec2c3c7d2fe5fbb1c55f0d8))
+* toolbox-app, toolbox-preflight, toolbox-watch and ./toolbox propose ([#33](https://github.com/GlueOps/toolbox/issues/33)) ([a356180](https://github.com/GlueOps/toolbox/commit/a35618058d4c8cf84a618d3f92a91d2ed9d33bdd))
+
+
+### Bug Fixes
+
+* PR [#37](https://github.com/GlueOps/toolbox/issues/37) review follow-ups - a smoke test that can't pass by accident ([#38](https://github.com/GlueOps/toolbox/issues/38)) ([9da537a](https://github.com/GlueOps/toolbox/commit/9da537a7ea2d02cf74f9108a32926f724e029ad8))
+
+
+### Documentation
+
+* split README into an AGENTS.md / HUMANS.md router ([#34](https://github.com/GlueOps/toolbox/issues/34)) ([6e51121](https://github.com/GlueOps/toolbox/commit/6e51121679fe8a9d5b0157fd08ca84981dc91893))
+
+
+### Tests
+
+* host smoke test, LF line endings, supported platforms ([#37](https://github.com/GlueOps/toolbox/issues/37)) ([9a89886](https://github.com/GlueOps/toolbox/commit/9a898866655c77e8ae33ea64d924ec3d29e7011d))
+
 ## [0.0.7](https://github.com/GlueOps/toolbox/compare/v0.0.6...v0.0.7) (2026-09-05)
 
 
