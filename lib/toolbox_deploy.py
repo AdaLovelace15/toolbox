@@ -22,8 +22,9 @@ never read as "change found" or "deploy failed".
 
 import argparse
 import copy
+import difflib
 import functools
-import hashlib
+import html
 import json
 import os
 import re
@@ -38,13 +39,36 @@ import yaml
 
 EXIT_SAME, EXIT_CHANGED, EXIT_ERROR, EXIT_WAITING, EXIT_FAILED = 0, 1, 2, 3, 4
 
-# GitHub rejects PR bodies over 65536 characters.
-MAX_BODY_DIFF = 40000
+# GitHub rejects PR bodies over 65536 characters. Aim below it; past it, drop the diffs.
+MAX_BODY, GITHUB_BODY_LIMIT = 60000, 65536
+OPEN_DIFF_LINES = 30      # a single app's diff this short is shown open, not collapsed
+REMOVED_LINES = 15        # how much of a removed resource to show
 
 DIFF_DIR = os.path.join(tempfile.gettempdir(), "toolbox-deploy")
 
-# Keys whose values never go into a PR body, even from the values diff.
-SECRETISH = re.compile(r"(?i)(pass(word|wd)?|secret|token|api[_-]?key|private[_-]?key|credential|auth|dsn)")
+# High-confidence credential shapes. A rendered diff matching one is not shown
+# at all: a PR body travels further than the repo and can't be scrubbed later.
+CREDENTIAL = re.compile(
+    r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"
+    # the same, base64-encoded: "-----BEGIN " then "PRIVATE KEY" at any alignment
+    r"|LS0tLS1CRUdJTi[A-Za-z0-9+/]{0,40}?(?:UFJJVkFURSBLRVk|BSSVZBVEUgS0VZ|QUklWQVRFIEtFWQ)"
+    r"|\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"
+    r"|\bgh[pousr]_[A-Za-z0-9]{36,}|\bgithub_pat_[A-Za-z0-9_]{30,}|\bglpat-[A-Za-z0-9_-]{20,}"
+    r"|\bxox[baprs]-[A-Za-z0-9-]{10,}|hooks\.slack\.com/services/T[A-Za-z0-9]+/"
+    r"|\bAIza[0-9A-Za-z_-]{35}\b|\b[sr]k_live_[0-9A-Za-z]{16,}|\bsk-ant-[A-Za-z0-9_-]{16,}"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+    # OpenBao/Vault, Grafana, npm, Docker Hub, age, SendGrid, DigitalOcean, Azure storage
+    r"|\bhv[sbr]\.[A-Za-z0-9_-]{20,}|\bs\.[A-Za-z0-9]{24}\b|\bglsa_[A-Za-z0-9_]{20,}|\bnpm_[A-Za-z0-9]{36}"
+    r"|\bdckr_pat_[A-Za-z0-9_-]{20,}|AGE-SECRET-KEY-1[0-9A-Z]{50,}|\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"
+    r"|\bdop_v1_[a-f0-9]{64}|AccountKey=[A-Za-z0-9+/=]{40,}"
+    # a password in a URL (the user may be empty); not a $VAR, %s, {{ template }} or <placeholder>
+    r"|\b[a-z][a-z0-9+.-]*://[^/\s:@'\"]*:[^/\s@'\"$<{%]+@")
+
+# A key that names a secret, with a literal value: withheld like a credential.
+# `secretName: x`, `existingSecret: x` and the like name a Secret; they don't hold one.
+SECRET_KEY = re.compile(r"(?i)(?<!existing)(?<!existing[_-])(?:password|passwd|secret|token|api[_-]?key"
+                        r"|access[_-]?key|private[_-]?key|client[_-]?secret|credentials?)$")
+PLACEHOLDER = re.compile(r"^(?:\$|\{\{|<|%|\*+$|changeme$|none$|null$|true$|false$|\+{8,}$)", re.I)
 
 
 class Fail(Exception):
@@ -129,6 +153,14 @@ class Tools:
     def dyff(self, old_path, new_path):
         return self.run(["dyff", "between", "--omit-header", "--ignore-order-changes",
                          old_path, new_path])
+
+    def server_version(self):
+        """ArgoCD server version, for the record; None if it can't be read."""
+        rc, out, _ = self.run(["argocd", "version", "-o", "json"])
+        try:
+            return (json.loads(out).get("server") or {}).get("Version") if rc == 0 else None
+        except (ValueError, AttributeError):
+            return None
 
 
 # ------------------------------------------------------------------ layout --
@@ -321,36 +353,71 @@ def spec_image_tag(layout):
 
 
 # --------------------------------------------------------------- manifests --
-def load_docs(text):
+_Loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)   # libyaml: much faster on big renders
+
+
+@functools.lru_cache(maxsize=16)
+def _parse(text):
     docs = []
-    for d in yaml.safe_load_all(text or ""):
-        if isinstance(d, dict) and d.get("kind") == "List" and isinstance(d.get("items"), list):
+    for d in yaml.load_all(text or "", Loader=_Loader):
+        # List, SecretList, ConfigMapList...: the items are the resources.
+        if isinstance(d, dict) and str(d.get("kind", "")).endswith("List") and isinstance(d.get("items"), list):
             docs += [i for i in d["items"] if isinstance(i, dict)]
         elif isinstance(d, dict):
             docs.append(d)
-    return docs
+    return tuple(docs)
+
+
+def load_docs(text):
+    """The resources in a render. Parsed once per text: treat them as read-only."""
+    return list(_parse(text or ""))
+
+
+def clean_text(s):
+    """Rendered text (names, images, keys) is chart-controlled: no control characters,
+    so it can't forge lines in what an agent reads."""
+    return re.sub(r"[\x00-\x1f\x7f\u2028\u2029\u0085]", "?", str(s))
 
 
 def res_key(d):
     meta = d.get("metadata") or {}
-    group = d.get("apiVersion", "").rpartition("/")[0]
+    group = str(d.get("apiVersion", "")).rpartition("/")[0]
     kind = f"{d.get('kind')}.{group}" if group else str(d.get("kind"))
     ns = meta.get("namespace")
-    return f"{kind}/{ns + '/' if ns else ''}{meta.get('name')}"
+    return clean_text(f"{kind}/{ns + '/' if ns else ''}{meta.get('name')}")
 
 
 def is_secret(d):
     return d.get("kind") == "Secret"
 
 
-def redact(docs):
-    """Secrets never leave the toolbox, not even in a diff."""
-    return [d for d in docs if not is_secret(d)]
+def hide_secret(d):
+    """A Secret with its values replaced by <hidden>; its keys stay. Other kinds unchanged.
+
+    ArgoCD already masks them in `app manifests`; this keeps it so if that changes."""
+    if not is_secret(d):
+        return d
+    d = dict(d)
+    for k in ("data", "stringData"):
+        if isinstance(d.get(k), dict):
+            d[k] = {key: "<hidden>" for key in d[k]}
+        elif d.get(k) is not None:
+            d[k] = "<hidden>"
+    meta = d.get("metadata")
+    if isinstance(meta, dict) and isinstance(meta.get("annotations"), dict):
+        # e.g. kubectl's last-applied-configuration holds the whole Secret.
+        d["metadata"] = dict(meta, annotations={k: "<hidden>" for k in meta["annotations"]})
+    return d
 
 
-def _secret_digest(d):
-    body = {k: d.get(k) for k in ("type", "data", "stringData", "immutable")}
-    return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+def masked_secrets(docs):
+    """Secrets whose values ArgoCD masked (`++++++++`), so a change to them can't be seen."""
+    out = []
+    for d in docs:
+        vals = [v for k in ("data", "stringData") if isinstance(d.get(k), dict) for v in d[k].values()]
+        if is_secret(d) and vals and all(isinstance(v, str) and v and set(v) == {"+"} for v in vals):
+            out.append(res_key(d))
+    return sorted(out)
 
 
 def _pod_spec(d):
@@ -368,7 +435,7 @@ def images(docs):
         ps = _pod_spec(d)
         for c in (ps.get("initContainers") or []) + (ps.get("containers") or []):
             if isinstance(c, dict) and c.get("image"):
-                out[(res_key(d), c.get("name"))] = c["image"]
+                out[(res_key(d), clean_text(c.get("name")))] = clean_text(c["image"])
     return out
 
 
@@ -380,7 +447,7 @@ def diff_paths(a, b, prefix="", out=None, limit=8):
     if isinstance(a, dict) and isinstance(b, dict):
         for k in sorted(set(a) | set(b), key=str):
             if a.get(k) != b.get(k):
-                diff_paths(a.get(k), b.get(k), f"{prefix}.{k}" if prefix else str(k), out, limit)
+                diff_paths(a.get(k), b.get(k), f"{prefix}.{clean_text(k)}" if prefix else clean_text(k), out, limit)
     elif isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
         for i, (x, y) in enumerate(zip(a, b)):
             if x != y:
@@ -397,22 +464,14 @@ class Change:
     changed: list
     paths: dict           # changed resource -> differing field paths (no values)
     images: list          # (resource, container, old, new)
-    secrets: list         # (symbol, resource) - contents never shown
 
     @property
     def any(self):
-        return bool(self.added or self.removed or self.changed or self.secrets)
+        return bool(self.added or self.removed or self.changed)
 
 
 def compare(old_text, new_text):
-    old_all, new_all = load_docs(old_text), load_docs(new_text)
-    old = {res_key(d): d for d in redact(old_all)}
-    new = {res_key(d): d for d in redact(new_all)}
-    so = {res_key(d): _secret_digest(d) for d in old_all if is_secret(d)}
-    sn = {res_key(d): _secret_digest(d) for d in new_all if is_secret(d)}
-    secrets = ([("+", k) for k in sorted(set(sn) - set(so))]
-               + [("-", k) for k in sorted(set(so) - set(sn))]
-               + [("~", k) for k in sorted(set(so) & set(sn)) if so[k] != sn[k]])
+    old, new = _index(old_text), _index(new_text)
     changed = sorted(k for k in set(old) & set(new) if old[k] != new[k])
     oi, ni = images(old.values()), images(new.values())
     imgs = sorted((r, c, oi.get((r, c)), ni.get((r, c)))
@@ -423,12 +482,90 @@ def compare(old_text, new_text):
         changed=changed,
         paths={k: diff_paths(old[k], new[k]) for k in changed},
         images=imgs,
-        secrets=secrets,
     )
 
 
+# The dumper the rendered diff reads well with: multi-line strings as `|`
+# blocks (a one-line edit to a config file is a one-line diff), unicode as is,
+# nothing folded, no anchors, keys sorted so ordering noise disappears.
+class _DiffDumper(getattr(yaml, "CSafeDumper", yaml.SafeDumper)):
+    def ignore_aliases(self, data):
+        return True
+
+
+_DiffDumper.add_representer(str, lambda d, s: d.represent_scalar(
+    "tag:yaml.org,2002:str", s, style="|" if "\n" in s else None))
+
+
+def _blockable(s):
+    """Can YAML show this multi-line string as a `|` block? Not with tabs, CRs or trailing spaces."""
+    return not re.search(r"[\t\r]| \n| $", s)
+
+
+def _lines_for_diff(v):
+    """Multi-line strings YAML would quote onto one line become a list of lines, so they diff by line."""
+    if isinstance(v, dict):
+        return {k: _lines_for_diff(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_lines_for_diff(x) for x in v]
+    if isinstance(v, str) and "\n" in v and not _blockable(v):
+        return v.split("\n")
+    return v
+
+# Set by ArgoCD on every resource; they differ between renders without meaning anything.
+ARGOCD_NOISE = {"labels": ("argocd.argoproj.io/instance",),
+                "annotations": ("argocd.argoproj.io/tracking-id", "argocd.argoproj.io/installation-id")}
+
+
+def _clean(d):
+    d = copy.deepcopy(hide_secret(d))
+    meta = d.get("metadata")
+    if isinstance(meta, dict):
+        for k, noise in ARGOCD_NOISE.items():
+            if isinstance(meta.get(k), dict):
+                for n in noise:
+                    meta[k].pop(n, None)
+                if not meta[k]:
+                    del meta[k]
+    return _lines_for_diff(d)
+
+
+def _dump(d):
+    text = yaml.dump(_clean(d), Dumper=_DiffDumper, sort_keys=True, default_flow_style=False,
+                     allow_unicode=True, width=1 << 30)
+    return [ln + "\n" for ln in text.split("\n")[:-1]]   # \n only: not U+2028 and friends
+
+
+def _index(text):
+    out = {}
+    for d in load_docs(text):
+        k, n = res_key(d), 2
+        while k in out:
+            k, n = f"{res_key(d)}#{n}", n + 1
+        out[k] = d
+    return out
+
+
+def rendered_diff(old_text, new_text, context=3):
+    """[(resource, unified diff)] for every resource whose render differs."""
+    old, new = _index(old_text), _index(new_text)
+    out = []
+    for k in sorted(set(old) | set(new)):
+        a = _dump(old[k]) if k in old else []
+        b = _dump(new[k]) if k in new else []
+        if a == b:
+            if k in old and k in new and is_secret(new[k]) and old[k] != new[k]:
+                out.append((k, f"--- a/{k}\n+++ b/{k}\n@@ Secret values changed (not shown) @@\n"))
+            continue
+        lines = list(difflib.unified_diff(a, b, f"a/{k}" if a else "/dev/null",
+                                          f"b/{k}" if b else "/dev/null", n=context))
+        if lines:
+            out.append((k, "".join(ln if ln.endswith("\n") else ln + "\n" for ln in lines)))
+    return out
+
+
 def write_dyff(tools, name, old_text, new_text):
-    """Full resource-level diff, kept in the container only. Secrets excluded."""
+    """Full resource-level diff, kept in the container. Secret values hidden."""
     try:
         os.makedirs(DIFF_DIR, exist_ok=True)
         work = tempfile.mkdtemp(dir=DIFF_DIR)
@@ -437,7 +574,7 @@ def write_dyff(tools, name, old_text, new_text):
             for suffix, text in (("old", old_text), ("new", new_text)):
                 p = os.path.join(work, f"{suffix}.yaml")
                 with open(p, "w", encoding="utf-8") as fh:
-                    yaml.safe_dump_all(redact(load_docs(text)), fh, sort_keys=False)
+                    yaml.safe_dump_all([hide_secret(d) for d in load_docs(text)], fh, sort_keys=False)
                 paths.append(p)
             rc, out, _ = tools.dyff(*paths)
         finally:
@@ -456,7 +593,7 @@ def summary_lines(name, ch, markdown=False):
     b = "`" if markdown else ""
     if not ch.any:
         return [f"{b}{name}{b}: no change"]
-    n = len(ch.added) + len(ch.removed) + len(ch.changed) + len(ch.secrets)
+    n = len(ch.added) + len(ch.removed) + len(ch.changed)
     lines = [f"{b}{name}{b}: {n} resource{'s' if n != 1 else ''} changed"]
     pre = "- " if markdown else "  "
     for sym, keys in (("+", ch.added), ("-", ch.removed)):
@@ -464,11 +601,166 @@ def summary_lines(name, ch, markdown=False):
     for k in ch.changed:
         fields = ", ".join(ch.paths.get(k) or [])
         lines.append(f"{pre}~ {b}{k}{b}" + (f" ({fields})" if fields else ""))
-    for sym, k in ch.secrets:
-        lines.append(f"{pre}{sym} {b}{k}{b} (contents not shown)")
     for r, c, o, n_ in ch.images:
         lines.append(f"{pre}image {b}{c}{b} in {b}{r}{b}: {b}{o or 'none'}{b} -> {b}{n_ or 'none'}{b}")
     return lines
+
+
+# ----------------------------------------------------------------- risks ----
+DATA_KINDS = {"PersistentVolumeClaim", "StatefulSet", "Namespace", "CustomResourceDefinition", "ExternalSecret"}
+IMMUTABLE = {"Deployment": (("spec", "selector"),),
+             "DaemonSet": (("spec", "selector"),),
+             "StatefulSet": (("spec", "selector"), ("spec", "volumeClaimTemplates"), ("spec", "serviceName"),
+                             ("spec", "podManagementPolicy")),
+             "Job": (("spec", "selector"), ("spec", "template"))}
+SCALABLE = {"Deployment", "StatefulSet", "ReplicaSet"}
+RISKS_CHECKED = ("removals, immutable fields, scale-downs, PodDisruptionBudgets, ingress hosts/TLS, "
+                 "image tags, prod with non-prod")
+# Warning severities, most serious first; the body sorts by them.
+SEV_DATA, SEV_DELETE, SEV_CHANGE, SEV_IMAGE, SEV_SPREAD = range(5)
+
+
+def _get(d, path):
+    for k in path:
+        d = d.get(k) if isinstance(d, dict) else None
+    return d
+
+
+def sync_mode(sync_policy):
+    """(automated, prune, self_heal) from an app's spec.syncPolicy."""
+    auto = (sync_policy or {}).get("automated")
+    if not isinstance(auto, dict) or auto.get("enabled") is False:
+        return False, False, False
+    return True, bool(auto.get("prune")), bool(auto.get("selfHeal"))
+
+
+def _image_tag(image):
+    """('digest'|'tag'|'none', tag) of an image reference."""
+    if "@" in image:
+        return "digest", image.rsplit("@", 1)[1]
+    last = image.rsplit("/", 1)[-1]
+    return ("tag", last.rsplit(":", 1)[1]) if ":" in last else ("none", "")
+
+
+def _containers(d):
+    ps = _pod_spec(d)
+    return [c for c in (ps.get("initContainers") or []) + (ps.get("containers") or []) if isinstance(c, dict)]
+
+
+def _ingress(d):
+    rules = (d.get("spec") or {}).get("rules") or []
+    tls = (d.get("spec") or {}).get("tls") or []
+    hosts = sorted({clean_text(r.get("host") or "*") for r in rules if isinstance(r, dict)})
+    return hosts, sorted(json.dumps(t, sort_keys=True) for t in tls)
+
+
+def _annotations(d):
+    return (d.get("metadata") or {}).get("annotations") or {}
+
+
+def _prune_option(d):
+    """'false' or 'confirm' from a Prune= sync option; '' otherwise. (Delete=false only
+    matters when the Application itself is deleted, not to prune.)"""
+    m = re.search(r"\bPrune=(false|confirm)\b", str(_annotations(d).get("argocd.argoproj.io/sync-options", "")))
+    return m.group(1) if m else ""
+
+
+def _recreated_by_argocd(d):
+    """Hooks, and resources synced with Replace or Force, are recreated, so an immutable
+    field changing is fine."""
+    a = _annotations(d)
+    return bool(a.get("argocd.argoproj.io/hook") or a.get("helm.sh/hook")
+                or re.search(r"\b(Replace|Force)=true\b", str(a.get("argocd.argoproj.io/sync-options", ""))))
+
+
+def _autoscaled(docs):
+    """(kind, name) of every workload an HorizontalPodAutoscaler scales."""
+    out = set()
+    for d in docs:
+        ref = _get(d, ("spec", "scaleTargetRef"))
+        if d.get("kind") == "HorizontalPodAutoscaler" and isinstance(ref, dict):
+            out.add((ref.get("kind"), ref.get("name")))
+    return out
+
+
+def _hosts(hosts, limit=5):
+    shown = ", ".join(_md(h) for h in hosts[:limit]) or "none"
+    return shown + (f" and {len(hosts) - limit} more" if len(hosts) > limit else "")
+
+
+def risk_flags(old_text, new_text, sync_policy):
+    """[(severity, warning)] a reviewer should look at twice, from the two renders and the sync policy."""
+    old, new = _index(old_text), _index(new_text)
+    auto, prune, _ = sync_mode(sync_policy)
+    hpa = _autoscaled(new.values())
+    flags = []
+    for k in sorted(set(old) - set(new)):
+        kind = old[k].get("kind")
+        sev, opt = SEV_DELETE, _prune_option(old[k])
+        if opt == "false":
+            what = "is removed from git but stays in the cluster (its sync-options say Prune=false)"
+        elif opt == "confirm":
+            what = "is removed from git; ArgoCD deletes it once someone confirms the prune in ArgoCD"
+        elif auto and prune:
+            what = "will be DELETED on merge"
+        elif auto:
+            what = "is removed from git but stays in the cluster, orphaned (prune is off)"
+        else:
+            what = "is removed from git; the next manual sync with prune deletes it"
+        if kind in DATA_KINDS and "stays" not in what:
+            what, sev = what + " - possible data loss", SEV_DATA
+        elif kind == "PodDisruptionBudget":
+            what += " - its pods lose their disruption protection"
+        flags.append((sev, f"{_md(k)} {what}"))
+    for k in sorted(set(old) & set(new)):
+        o, n = old[k], new[k]
+        if o == n:
+            continue
+        kind = n.get("kind")
+        for path in () if _recreated_by_argocd(n) else IMMUTABLE.get(kind, ()):
+            if _get(o, path) != _get(n, path):
+                flags.append((SEV_DATA, f"{_md(k)}: `{'.'.join(path)}` is immutable - the sync will fail "
+                                        "unless the resource is deleted and recreated"))
+        ro, rn = _get(o, ("spec", "replicas")), _get(n, ("spec", "replicas"))
+        if kind in SCALABLE and (kind, _get(n, ("metadata", "name"))) not in hpa and isinstance(ro, int):
+            if isinstance(rn, int) and rn < ro:
+                flags.append((SEV_CHANGE, f"{_md(k)}: " + ("scaled to 0 replicas" if rn == 0 else f"replicas {ro} → {rn}")))
+            elif rn is None and ro > 1:
+                flags.append((SEV_CHANGE, f"{_md(k)}: `spec.replicas` removed - it falls back to 1 (was {ro})"))
+        if kind == "PodDisruptionBudget":
+            flags.append((SEV_CHANGE, f"{_md(k)}: PodDisruptionBudget changed "
+                                      f"({', '.join(map(_md, diff_paths(o, n)))})"))
+        if kind == "Ingress":
+            (ho, to), (hn, tn) = _ingress(o), _ingress(n)
+            if ho != hn:
+                flags.append((SEV_CHANGE, f"{_md(k)}: ingress hosts {_hosts(ho)} → {_hosts(hn)}"))
+            if to != tn:
+                flags.append((SEV_CHANGE, f"{_md(k)}: ingress TLS changed"))
+    for k in sorted(new):
+        before = {c.get("name"): c.get("image") for c in _containers(old.get(k) or {})}
+        for c in _containers(new[k]):
+            img = c.get("image")
+            if not isinstance(img, str) or before.get(c.get("name")) == img:
+                continue
+            form, tag = _image_tag(img)
+            was = _image_tag(before[c.get("name")])[0] if isinstance(before.get(c.get("name")), str) else None
+            # No resource name: the same image in several apps becomes one warning.
+            if form == "none" or tag == "latest":
+                always = "; with `imagePullPolicy: Always`, every restart may pull a different image" \
+                    if c.get("imagePullPolicy") == "Always" else ""
+                flags.append((SEV_IMAGE, f"floating image {_md(img)} "
+                                         f"({'no tag' if form == 'none' else 'tag `latest`'}{always})"))
+            elif was == "digest" and form == "tag":
+                flags.append((SEV_IMAGE, f"pinned digest replaced by the tag {_md(img)}"))
+    return sorted(set(flags), key=lambda f: (f[0], f[1]))
+
+
+def is_prod(env):
+    """A production environment name: prod, prd, production, prod-eu, ... - not preprod or non-prod."""
+    e = (env or "").lower()
+    if re.search(r"(pre|non)[-_.]?(prod|prd)", e):
+        return False
+    return bool(re.search(r"(^|[-_.])(prod|prd|production)\d*($|[-_.])", e))
 
 
 # ------------------------------------------------------------------- git ----
@@ -606,6 +898,102 @@ class Preflight:
     baseline: str      # what the change is compared against, for humans
     change: Change
     diff_file: str
+    old_text: str = ""
+    new_text: str = ""
+    base_sha: str = ""            # the merge base compared with; "" when it is the live desired state
+    app: dict = field(default_factory=dict)
+    masked: list = field(default_factory=list)    # Secrets ArgoCD masked: a change to them can't be seen
+    withheld: str = ""            # why the rendered diff must not be shown, or ""
+    spec_values: bool = False     # the app spec sets Helm values itself, outside this repo
+
+    @property
+    def unseen(self):
+        """Nothing visible changed, but a masked Secret might have: the changed file feeds
+        this app, and ArgoCD can't show whether its Secret values moved."""
+        return not self.change.any and bool(self.masked)
+
+    def diff(self):
+        if self.withheld:
+            return []
+        chunks = rendered_diff(self.old_text, self.new_text)
+        return [] if credential_in_resources(self, [k for k, _ in chunks]) else chunks
+
+    def credential(self):
+        return not self.withheld and credential_in_resources(self, [k for k, _ in rendered_diff(
+            self.old_text, self.new_text)])
+
+
+def secretish(v, key=""):
+    """A literal value under a key that names a secret - env `{name: DB_PASSWORD, value: x}`
+    included. Secrets (values hidden anyway) and placeholders don't count."""
+    if isinstance(v, dict):
+        if v.get("kind") == "Secret":
+            return False
+        if isinstance(v.get("name"), str) and isinstance(v.get("value"), str) and SECRET_KEY.search(v["name"]):
+            if len(v["value"]) >= 4 and not PLACEHOLDER.search(v["value"]):
+                return True
+        return any(secretish(x, str(k)) for k, x in v.items())
+    if isinstance(v, list):
+        return any(secretish(x, key) for x in v)
+    if isinstance(v, str) and key and SECRET_KEY.search(key):
+        return len(v) >= 4 and not PLACEHOLDER.search(v) and "\n" not in v
+    if isinstance(v, str) and "\n" in v:   # a config file in a ConfigMap: key: value lines
+        return any(SECRET_KEY.search(m.group(1)) and len(m.group(2)) >= 4 and not PLACEHOLDER.search(m.group(2))
+                   for m in re.finditer(r"(?m)^[ \t]*[\"']?([A-Za-z0-9_.-]+)[\"']?[ \t]*[:=][ \t]*[\"']?([^\s\"'#]+)", v))
+    return False
+
+
+def credential_in_resources(pf, keys):
+    """Does any resource that changed look like it holds a credential - anywhere in it,
+    not only in the lines that changed (a PEM body can change without its header)?"""
+    old, new = _index(pf.old_text), _index(pf.new_text)
+    return any(CREDENTIAL.search("".join(_dump(side[k]))) or secretish(side[k])
+               for k in keys for side in (old, new) if k in side)
+
+
+def withheld_reason(app, layout, repos):
+    """Why this app's render may hold things that aren't in the deployment repo, or ""."""
+    spec = app.get("spec") or {}
+    sources = spec.get("sources") or ([spec["source"]] if spec.get("source") else [])
+    st = app.get("status") or {}
+    if (any(isinstance(s, dict) and s.get("plugin") is not None for s in sources)
+            or st.get("sourceType") == "Plugin" or "Plugin" in (st.get("sourceTypes") or [])):
+        return "it is rendered by a config-management plugin, which can inject secrets"
+    ours = {(r.position, normalize_url(r.url)) for r in repos}
+    elsewhere = sorted({v.raw if v.repo is None else v.repo.url for v in layout.value_files
+                        if v.repo is None or re.search(r"[a-z][a-z0-9+.-]*://", v.raw)
+                        or (v.repo.position, normalize_url(v.repo.url)) not in ours})
+    if elsewhere:
+        return f"it reads values from outside this repo ({', '.join(elsewhere)})"
+    templates = sorted({r.url for r in layout.repos if not r.ref
+                        and normalize_url(r.url) not in {u for _, u in ours}})
+    if templates:
+        return f"it renders templates from another repo ({', '.join(templates)})"
+    if spec_values_secret(layout):
+        return "its Application spec sets a Helm value that looks like a credential (that isn't in this repo)"
+    return ""
+
+
+SPEC_VALUE_KEYS = ("values", "valuesObject", "parameters", "fileParameters")
+
+
+def has_spec_values(layout):
+    helm = layout.chart.get("helm") or {}
+    return any(helm.get(k) for k in SPEC_VALUE_KEYS)
+
+
+def spec_values_secret(layout):
+    """Helm values the Application spec sets (outside this repo) that look like a credential."""
+    helm = layout.chart.get("helm") or {}
+    spec = {k: helm.get(k) for k in SPEC_VALUE_KEYS if helm.get(k)}
+    params = [{"name": p.get("name"), "value": p.get("value")} for p in helm.get("parameters") or []
+              if isinstance(p, dict)]
+    try:
+        inline = yaml.safe_load(helm.get("values") or "") if isinstance(helm.get("values"), str) else None
+    except yaml.YAMLError:
+        inline = None
+    return bool(CREDENTIAL.search(json.dumps(spec, default=str)) or secretish(params) or secretish(inline)
+                or secretish(helm.get("valuesObject")))
 
 
 def preflight(tools, name, rev, root=None, diff_file=True):
@@ -617,7 +1005,7 @@ def preflight(tools, name, rev, root=None, diff_file=True):
     tracked = repos[0].revision
     if rev in (tracked, f"origin/{tracked}") or (tracked == "HEAD" and rev in ("main", "master")):
         raise Fail(f"{rev} is the branch {lay.name} already tracks; pass the pushed branch or commit to test")
-    old_text, baseline = None, f"{tracked} today"
+    old_text, baseline, base_sha = None, f"{tracked} today", ""
     sha = rev
     if root:
         sha = resolve_rev(tools, root, rev)
@@ -626,13 +1014,25 @@ def preflight(tools, name, rev, root=None, diff_file=True):
             # Compare with where the branch left the tracked branch, so whatever
             # merged since doesn't show up reversed.
             old_text = tools.manifests(lay.name, repos, mb)
-            baseline = f"{mb[:12]}, where it left {tracked}"
+            baseline, base_sha = f"{mb[:12]}, where it left {tracked}", mb
     if old_text is None:
         old_text = tools.manifests(lay.name)
     new_text = tools.manifests(lay.name, repos, sha)
     ch = compare(old_text, new_text)
     path = write_dyff(tools, lay.name, old_text, new_text) if (diff_file and ch.any) else None
-    return Preflight(lay, repos, sha, baseline, ch, path)
+    return Preflight(lay, repos, sha, baseline, ch, path, old_text, new_text, base_sha, app,
+                     masked_secrets(load_docs(new_text)), withheld_reason(app, lay, repos),
+                     has_spec_values(lay))
+
+
+def secret_note(keys):
+    names = ", ".join(_md(k) for k in keys)
+    return (f"ArgoCD shows no change, but it masks Secret values, so it can't tell whether {names} "
+            "changed. Check in the Files tab that the change is meant to reach it")
+
+
+CREDENTIAL_MSG = ("possible credential in a changed resource - not shown. Check the Files tab; "
+                  "if it is one, it belongs in OpenBao, not in git")
 
 
 @guarded
@@ -641,33 +1041,46 @@ def main_preflight(argv, tools=None):
     p = argparse.ArgumentParser(prog="toolbox-preflight", description=(
         "Have ArgoCD render a pushed branch or commit of the deployment repo and "
         "compare it with its render of where that branch started. Read-only. "
-        "Exit 0 no change, 1 change, 2 error."))
+        "Exit 0 no change, 1 change (or a Secret ArgoCD masks, so it can't tell), 2 error."))
     p.add_argument("app")
     p.add_argument("--rev", required=True, help="pushed branch or commit")
     p.add_argument("--repo-root", help="deployment repo clone (default: the git repo you are in)")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--diff", action="store_true",
+                   help="also print the rendered manifest diff (what the PR body shows)")
     a = p.parse_args(argv)
     pf = preflight(tools, a.app, a.rev, a.repo_root or git_toplevel(tools, os.getcwd()))
     ch = pf.change
-    code = EXIT_CHANGED if ch.any else EXIT_SAME
+    code = EXIT_CHANGED if (ch.any or pf.unseen) else EXIT_SAME
     positions = [r.position or 1 for r in pf.repos]
+    chunks = pf.diff() if a.diff else []
+    withheld = pf.withheld or (CREDENTIAL_MSG if a.diff and pf.credential() else "")
     if a.json:
-        print(json.dumps({"app": pf.layout.name, "rev": pf.sha, "baseline": pf.baseline,
-                          "source_positions": positions,
-                          "added": ch.added, "removed": ch.removed, "changed": ch.changed,
-                          "changed_fields": ch.paths,
-                          "secrets": [{"change": s, "resource": k} for s, k in ch.secrets],
-                          "images": [{"resource": r, "container": c, "old": o, "new": n}
-                                     for r, c, o, n in ch.images],
-                          "diff_file": pf.diff_file, "exit": code}, indent=2))
+        out = {"app": pf.layout.name, "rev": pf.sha, "baseline": pf.baseline,
+               "source_positions": positions,
+               "added": ch.added, "removed": ch.removed, "changed": ch.changed,
+               "changed_fields": ch.paths, "masked_secrets": pf.masked, "secret_change_unknown": pf.unseen,
+               "images": [{"resource": r, "container": c, "old": o, "new": n}
+                          for r, c, o, n in ch.images],
+               "diff_file": pf.diff_file, "exit": code}
+        if a.diff:
+            out["diff"] = None if withheld else "".join(t for _, t in chunks)
+            out["diff_withheld"] = withheld or None
+        print(json.dumps(out, indent=2))
         return code
     print(f"rendered by ArgoCD at {pf.sha[:12]} (source position {', '.join(map(str, positions))}), "
           f"compared with {pf.baseline}")
     print("\n".join(summary_lines(pf.layout.name, ch)))
+    if pf.unseen:
+        print("  " + secret_note(pf.masked).replace("`", ""))
+    if a.diff and withheld:
+        print(f"rendered diff not shown: {withheld}")
+    elif chunks:
+        print("".join(t for _, t in chunks), end="")
     if pf.diff_file:
-        print(f"full diff (Secrets excluded): ./toolbox cat {pf.diff_file}")
-    if ch.any:
-        log("next: open the PR with ./toolbox propose; never paste rendered manifests into it")
+        print(f"full diff: <toolbox> cat {pf.diff_file}")
+    if ch.any or pf.unseen:
+        log("next: open the PR with ./toolbox propose - it puts this rendered diff in the PR body")
     return code
 
 
@@ -900,19 +1313,304 @@ def scan(tools, root, default_branch, changed):
     return sorted(hits), sorted(used), sorted(tracked)
 
 
-def redact_diff(diff):
-    """Mask the values of secret-looking keys on added/removed lines."""
+# --------------------------------------------------------------- PR body ----
+def _fence(text):
+    """A code fence longer than any run of backticks in `text`."""
+    run = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    return "`" * max(3, run + 1)
+
+
+def _shares(sizes, budget):
+    """Split `budget` so small sizes are met in full and big ones share the rest equally."""
+    out, left = [0] * len(sizes), max(0, budget)
+    order = sorted(range(len(sizes)), key=lambda i: sizes[i])
+    for n, i in enumerate(order):
+        out[i] = min(sizes[i], left // (len(sizes) - n))
+        left -= out[i]
+    return out
+
+
+def _app_env(layout):
+    return next((repo_app_env(v.path)[1] for v in layout.value_files
+                 if v.repo and repo_app_env(v.path)[0]), None)
+
+
+def _md(text):
+    """Inline code, safe in a table cell or list item."""
+    t = str(text).replace("|", "\\|").replace("\n", " ").replace("`", "'")
+    return f"`{t}`"
+
+
+def _defuse(text):
+    """Only the footer may carry the deploy marker: the cleanup workflow reads the first
+    `glueops-deploy:` it finds, wherever it is, so an echo of one elsewhere is broken."""
+    return re.sub(r"(?i)glueops-deploy(\s*):", "glueops\u200b-deploy\\1:", text)
+
+
+@dataclass
+class AppReport:
+    pf: Preflight
+    env: str
+    flags: list             # [(severity, warning)]
+    chunks: list            # [(resource, diff text)], ordered and trimmed; [] when withheld
+    withheld: str           # why the diff isn't shown, or ""
+    fold_key: str = ""      # the untrimmed diff with the app's name taken out
+    same_as: str = ""       # another app whose diff this one repeats
+
+    @property
+    def name(self):
+        return self.pf.layout.name
+
+
+def _order(pf, flags, chunks):
+    """Removed first (trimmed), then flagged changes, other changes, added."""
+    ch = pf.change
+    flagged = {k for k in ch.changed if any(_md(k) in f for _, f in flags)}
+
+    def rank(k):
+        if k in ch.removed:
+            return 0
+        if k in flagged:
+            return 1
+        return 3 if k in ch.added else 2
+
     out = []
-    for line in diff.splitlines():
-        if line[:1] in "+-" and not line.startswith(("+++", "---")):
-            m = re.match(r"^([+-]\s*-?\s*[\"']?([\w.-]+)[\"']?\s*:\s*)(\S.*)$", line)
-            if m and SECRETISH.search(m.group(2)):
-                line = m.group(1) + "<redacted>"
-            m = re.match(r"^([+-]\s*value\s*:\s*)(\S.*)$", line)
-            if m and out and SECRETISH.search(out[-1]):
-                line = m.group(1) + "<redacted>"
-        out.append(line)
-    return "\n".join(out)
+    for k, text in sorted(chunks, key=lambda c: (rank(c[0]), c[0])):
+        if rank(k) == 0:
+            lines = text.splitlines(keepends=True)
+            if len(lines) > REMOVED_LINES + 3:
+                text = "".join(lines[:REMOVED_LINES + 3]) + f"  ... ({len(lines) - REMOVED_LINES - 3} more lines)\n"
+        out.append((k, text))
+    return out
+
+
+def build_reports(pfs):
+    reps = []
+    for pf in pfs:
+        flags = risk_flags(pf.old_text, pf.new_text, (pf.app.get("spec") or {}).get("syncPolicy"))
+        chunks, withheld = [], pf.withheld
+        if not withheld:
+            chunks = rendered_diff(pf.old_text, pf.new_text)
+            if credential_in_resources(pf, [k for k, _ in chunks]):
+                chunks, withheld = [], CREDENTIAL_MSG
+        short = pf.layout.name.rsplit("/", 1)[-1]
+        key = json.dumps([(k.replace(short, "<app>"), t.replace(short, "<app>")) for k, t in chunks])
+        reps.append(AppReport(pf, _app_env(pf.layout), flags, _order(pf, flags, chunks), withheld, key))
+    seen = {}
+    for r in reps:
+        if r.chunks and r.fold_key in seen:
+            r.same_as = seen[r.fold_key]
+        else:
+            seen.setdefault(r.fold_key, r.name)
+    return reps
+
+
+def _counts(ch, bold=True):
+    parts = [f"{len(ch.changed)} changed" if ch.changed else "", f"{len(ch.added)} added" if ch.added else "",
+             (f"**{len(ch.removed)} removed**" if bold else f"{len(ch.removed)} removed") if ch.removed else ""]
+    return ", ".join(p for p in parts if p)
+
+
+def _warnings(reps):
+    """[(severity, line)] across every app: identical warnings are merged, the most serious first."""
+    merged = {}
+    for r in reps:
+        for sev, text in r.flags:
+            merged.setdefault((sev, text), []).append(r.name)
+        if r.pf.unseen:
+            merged.setdefault((SEV_CHANGE, secret_note(r.pf.masked)), []).append(r.name)
+    out = []
+    for (sev, text), apps in sorted(merged.items()):
+        if len(reps) > 1 and len(apps) == len(reps):
+            out.append((sev, f"every app: {text}"))
+        elif len(apps) > 1:
+            out.append((sev, f"{text} - in {', '.join(f'`{a}`' for a in apps)}"))
+        else:
+            out.append((sev, f"`{apps[0]}`: {text}"))
+    envs = {r.env for r in reps if r.env and (r.pf.change.any or r.pf.unseen)}
+    prod = sorted(e for e in envs if is_prod(e))
+    other = sorted(e for e in envs if not is_prod(e))
+    if prod and other:
+        out.append((SEV_SPREAD, f"prod ({', '.join(f'`{e}`' for e in prod)}) changes together with non-prod "
+                                f"({', '.join(f'`{e}`' for e in other)}): consider one PR per environment"))
+    return out
+
+
+def _on_merge(reps):
+    groups = {}
+    for r in reps:
+        auto, prune, heal = sync_mode((r.pf.app.get("spec") or {}).get("syncPolicy"))
+        if auto:
+            what = (f"ArgoCD syncs automatically, within about 3 min; "
+                    f"prune {'on' if prune else 'off'}, self-heal {'on' if heal else 'off'}")
+        else:
+            what = "manual sync: nothing changes in the cluster until someone syncs it in ArgoCD"
+        groups.setdefault(what, []).append(r)
+    if len(groups) == 1 and len(reps) > 1:
+        return [f"- all {len(reps)} apps: {next(iter(groups))}"]
+    if len(reps) > 20:   # too many to name: say how many follow each policy
+        return [f"- {len(rs)} apps: {what}" for what, rs in groups.items()]
+    return [f"- {', '.join(f'`{r.name}`' for r in rs)}: {what}" for what, rs in groups.items()]
+
+
+def _summary(reps, n_warnings):
+    changing = [r for r in reps if r.pf.change.any or r.pf.unseen]
+    envs = sorted({r.env for r in changing if r.env})
+    tot = Change(*([sum((getattr(r.pf.change, f) for r in changing), []) for f in ("added", "removed", "changed")]
+                   + [{}, []]))
+    imgs = sorted({(o or "none", n or "none") for r in changing for _, _, o, n in r.pf.change.images})
+    what = _counts(tot) or "no visible change"
+    if imgs and len(imgs) <= 2:
+        what += "; image " + ", ".join(f"{_md(o)} → {_md(n)}" for o, n in imgs)
+    apps = f"{len(changing)} app{'s' if len(changing) != 1 else ''}"
+    warn = f"{n_warnings} warning{'s' if n_warnings != 1 else ''}" if n_warnings else "no warnings"
+    where = f" ({', '.join(envs[:8])}{f' and {len(envs) - 8} more' if len(envs) > 8 else ''})" if envs else ""
+    return f"**{apps}{where}: {what}. {warn}.**"
+
+
+def _table(reps):
+    server = re.sub(r"^[a-z]+://", "", os.environ.get("ARGOCD_SERVER", "")).strip("/")
+    rows = ["| app | env | resources | image |", "|---|---|---|---|"]
+    for r in reps:
+        ch = r.pf.change
+        imgs = sorted({(o or "none", n or "none") for _, _, o, n in ch.images})
+        img = "<br>".join(f"{_md(o)} → {_md(n)}" for o, n in imgs) or "-"
+        meta = r.pf.app.get("metadata") or {}
+        path = "/".join(x for x in (meta.get("namespace"), meta.get("name")) if x)
+        app = f"[{_md(r.name)}](https://{server}/applications/{path})" if server and path else _md(r.name)
+        res = _counts(ch) or ("no visible change (Secret values masked)" if r.pf.unseen else "no visible change")
+        rows.append(f"| {app} | {_md(r.env) if r.env else '-'} | {res} | {img} |")
+    return rows
+
+
+def _diff_block(rep, shown, omitted, hint, open_):
+    text = "".join(t for _, t in shown)
+    fence = _fence(text)
+    counts = _counts(rep.pf.change, bold=False) or "no visible change"
+    title = f"<code>{html.escape(rep.name)}</code>: {counts}"
+    out = ([f"**{title}**", ""] if open_ else [f"<details><summary>{title}</summary>", ""])
+    if shown:
+        out += [fence + "diff", text.rstrip("\n"), fence, ""]
+    if omitted:
+        names = ", ".join(_md(k) for k in omitted[:20]) + (f" and {len(omitted) - 20} more" if len(omitted) > 20 else "")
+        out += [f"Not shown, to keep this description under GitHub's size limit: {names}. {hint}", ""]
+    if not open_:
+        out += ["</details>", ""]
+    return out
+
+
+def _fit(chunks, budget):
+    """The whole resources that fit in `budget` characters, in order, skipping any that
+    don't; the names of those skipped; and the characters used."""
+    shown, omitted, used = [], [], 0
+    for k, t in chunks:
+        if used + len(t) > budget:
+            omitted.append(k)
+            continue
+        shown.append((k, t))
+        used += len(t)
+    return shown, omitted, used
+
+
+TOOLBOX = "<path-to-toolbox>/toolbox"
+
+
+def render_body(reps, *, intent, rev, default_branch, version, marker, level=0, intent_cut=False):
+    """The PR description: what merging does, what to look at, then the evidence.
+
+    level 0 has the diffs; 1 drops them; 2 is a last resort for very many apps."""
+    warnings = _warnings(reps)
+    width = 600 if level < 2 else 200
+    lines = [f"- {w}" if len(w) <= width else f"- {w[:width]}…" for _, w in warnings]
+    cap = 60 if level < 2 else 15
+    if len(lines) > cap:
+        lines = lines[:cap] + [f"- ... and {len(lines) - cap} more, less serious"]
+    top = [_summary(reps, len(warnings)), "", "**On merge**", *_on_merge(reps), "", "**Warnings**"]
+    top += lines or [f"- None of the automatic checks fired ({RISKS_CHECKED}). "
+                     "They don't judge config values: read the diff."]
+    top += [""]
+    if intent:
+        top += ["**Intent**, as written by the proposer (not verified)"
+                + (" - cut short here" if intent_cut else "") + ":", "",
+                _fence(intent) + "text", intent, _fence(intent), ""]
+    top += ["### What changes",
+            f"ArgoCD's render of `{rev[:12]}` compared with its render of the merge base with "
+            f"`{default_branch}`, for every ArgoCD app visible to the proposer that reads a changed "
+            "file. This is what the change does; the values diff is in the Files tab.", ""]
+    if level < 2:
+        top += _table(reps) + [""]
+        notes = []
+        for r in reps:
+            if r.withheld:
+                notes.append(f"- `{r.name}`: rendered diff not shown: {r.withheld}")
+            if r.same_as:
+                notes.append(f"- `{r.name}`: same diff as `{r.same_as}`, apart from its name")
+        spec = [r.name for r in reps if r.pf.spec_values]
+        if spec:
+            who = "every app's" if len(spec) == len(reps) > 1 else ", ".join(f"`{a}`" for a in spec) + (
+                "'s" if len(spec) == 1 else "")
+            notes.append(f"- {who} Application spec also sets Helm values: they are in the render, "
+                         "but not in this repo")
+        top += notes + ([""] if notes else [])
+    else:
+        top += [f"{len(reps)} apps: too many to list here. Run the commands below to see each one.", ""]
+
+    charts = sorted({f"{_md(c.get('repoURL', '?'))} {_md(c.get('chart') or c.get('path') or '?')}"
+                     f"@{_md(c.get('targetRevision', '?'))}" for r in reps for c in [r.pf.layout.chart] if c})
+    if len(charts) > 5:
+        charts = charts[:5] + [f"and {len(charts) - 5} more"]
+    bases = sorted({r.pf.base_sha for r in reps if r.pf.base_sha})
+    positions = sorted({" ".join(str(x.position) for x in r.pf.repos if x.position) for r in reps})
+
+    def raw(sha):   # single-source apps take --revision; multi-source ones a revision per source
+        if positions == [""]:
+            return f"--revision {sha}"
+        if len(positions) == 1 and " " not in positions[0]:
+            return f"--revisions {sha} --source-positions {positions[0]}"
+        return f"--revisions {sha} --source-positions <n>` (per app, see `toolbox-app`)`"
+    base_txt = (f"the merge base with `{default_branch}`, `{bases[0]}`" if len(bases) == 1 else
+                f"the merge base with `{default_branch}`" if bases else
+                f"`{default_branch}` as ArgoCD had it at render time")
+    how = ["<details><summary>How this was rendered</summary>", "",
+           f"- head `{rev}`, compared with {base_txt}",
+           f"- ArgoCD server {f'`{version}`' if version else 'version unknown'}; chart {', '.join(charts) or 'n/a'}",
+           f"- to reproduce, from your deployment-repo clone after `git fetch`: "
+           f"`{TOOLBOX} toolbox-preflight <app> --rev {rev} --diff` for each app above",
+           f"- or raw: `argocd app manifests <app> {raw(rev)}` and `argocd app manifests <app> "
+           f"{raw(bases[0] if len(bases) == 1 else '<merge-base>')}`, then diff the two",
+           f"- if this PR's head isn't `{rev[:12]}`, this description is stale: run `toolbox propose` again",
+           "", "</details>", ""]
+    foot = ["---",
+            f"Opened with `toolbox propose`. After the merge, from your deployment-repo clone: "
+            f"`{TOOLBOX} toolbox-watch <app> --rev <merge-sha>` for each app above; if it fails, "
+            f"`{TOOLBOX} propose --revert <merge-sha>` opens a revert PR."]
+
+    hint = f"`{TOOLBOX} toolbox-preflight <app> --rev {rev[:12]} --diff` shows everything."
+    blocks = []
+    shown = [r for r in reps if r.chunks and not r.same_as] if level == 0 else []
+    if shown:
+        skeleton = len("\n".join(top + how + foot))
+        overhead = sum(400 + 120 * min(len(r.chunks), 20) for r in shown)   # headers, fences, omitted names
+        sizes = [sum(len(t) for _, t in r.chunks) for r in shown]
+        shares = _shares(sizes, MAX_BODY - skeleton - overhead)
+        fits = [_fit(r.chunks, s) for r, s in zip(shown, shares)]
+        short = [i for i, (_, om, _) in enumerate(fits) if om]
+        spare = sum(s - used for s, (_, om, used) in zip(shares, fits) if not om)
+        for i in short:   # what the apps shown whole left unused goes to the cut ones
+            fits[i] = _fit(shown[i].chunks, shares[i] + spare // len(short))
+        single = len(reps) == 1
+        for r, (vis, omitted, _) in zip(shown, fits):
+            lines_n = sum(t.count("\n") for _, t in vis)
+            blocks += _diff_block(r, vis, omitted, hint, open_=single and not omitted and lines_n <= OPEN_DIFF_LINES)
+    elif level >= 1 and any(r.chunks for r in reps):
+        blocks += [f"Rendered diffs left out: they don't fit GitHub's size limit. {hint}", ""]
+    body = _defuse("\n".join(top + blocks + how + foot))
+    if marker:
+        body += f"\n\n<!-- glueops-deploy:{marker} -->"
+    if len(body) > GITHUB_BODY_LIMIT and level < 2:
+        return render_body(reps, intent=intent, rev=rev, default_branch=default_branch, version=version,
+                           marker=marker, level=level + 1, intent_cut=intent_cut)
+    return body
 
 
 @guarded
@@ -967,38 +1665,34 @@ def main_propose(argv, tools=None):
     changed = changed_files(tools, root, a.base, a.rev)
     if not changed:
         raise Fail(f"{a.rev[:12]} changes nothing against {a.base}")
+    if CREDENTIAL.search(a.message):
+        raise Fail("the -m intent looks like it contains a credential; it would go into the PR description. "
+                   "Run again without it")
     apps, _, _ = scan(tools, root, default_branch, changed)
     if not apps:
         raise Fail("no ArgoCD app reads these files from " + default_branch)
-    sections, any_change = [], False
+    pfs = []
     for name in apps:
         pf = preflight(tools, name, a.rev, root)
-        any_change = any_change or pf.change.any
-        sections.append("\n".join(summary_lines(pf.layout.name, pf.change, markdown=True)))
-        log("\n".join(summary_lines(pf.layout.name, pf.change))
-            + (f"\n  full diff: ./toolbox cat {pf.diff_file}" if pf.diff_file else ""))
-    if not any_change:
+        pfs.append(pf)
+        # Summaries only: agents read stderr, and the diff belongs in the PR.
+        log("\n".join(summary_lines(pf.layout.name, pf.change)
+                      + ([f"  {secret_note(pf.masked)}".replace("`", "")] if pf.unseen else []))
+            + (f"\n  full diff: <toolbox> cat {pf.diff_file}" if pf.diff_file else ""))
+    if not any(pf.change.any or pf.unseen for pf in pfs):
         log("ArgoCD renders no change for any affected app; nothing to propose")
         return EXIT_SAME
     mb = merge_base(tools, root, a.base, a.rev) or a.base
     d = describe(changed, lambda f: file_at(tools, root, mb, f),
                  lambda f: file_at(tools, root, a.rev, f), a.message)
-    _, diff = tools.git(root, "diff", "--no-renames", f"{a.base}...{a.rev}")
-    diff = redact_diff(diff)
-    if len(diff) > MAX_BODY_DIFF:
-        diff = diff[:MAX_BODY_DIFF] + "\n... (truncated; see the Files tab)"
-    intro = a.message.strip() or (f"Reverts {a.revert_of}." if a.revert_of else "")
-    body = [intro, "", "### What changes",
-            f"Rendered by ArgoCD from `{a.rev[:12]}` (`toolbox-preflight`) and compared with its "
-            f"render of where this branch left `{default_branch}`, for every ArgoCD app visible to "
-            "the proposer that reads a changed file. Secrets are compared but never shown; "
-            "rendered manifests are deliberately not included.", "",
-            *sections, "", "### Values diff",
-            "Values of secret-looking keys are masked here; the Files tab has the real diff.", "",
-            "```diff", diff.rstrip(), "```", "", "---",
-            f"Opened with `./toolbox propose`. Nothing deploys until this is merged; ArgoCD "
-            f"then syncs `{default_branch}` automatically."]
-    if d["marker"] and not a.revert_of:
-        body += ["", f"<!-- glueops-deploy:{d['marker']} -->"]
-    print("\n".join(body))
+    intent = a.message.strip() or (f"Reverts {a.revert_of}." if a.revert_of else "")
+    marker = d["marker"] if d["marker"] and not a.revert_of else ""
+    reps = build_reports(pfs)
+    warnings = _warnings(reps)
+    if warnings:
+        # The agent hands the human the link: it has to know what the PR warns about.
+        log("warnings in the PR - tell the human, or fix the change if you didn't intend one:\n"
+            + "\n".join(f"  - {w}".replace("`", "") for _, w in warnings))
+    print(render_body(reps, intent=intent[:4000], rev=pfs[0].sha, default_branch=default_branch,
+                      version=tools.server_version(), marker=marker, intent_cut=len(intent) > 4000))
     return EXIT_CHANGED

@@ -271,7 +271,13 @@ def pending_path():
 
 
 # A pending code with less time than this left is not worth handing out again.
-PENDING_REUSE_MIN = 30
+# The wrapper asks for more when an agent re-sends a code: the human only reads
+# it after the agent's turn ends.
+def pending_reuse_min():
+    try:
+        return int(os.environ.get("TOOLBOX_PENDING_MIN_LEFT") or 30)
+    except ValueError:
+        return 30
 
 
 def begin_device_flow(force=False):
@@ -288,7 +294,7 @@ def begin_device_flow(force=False):
     """
     if not force:
         live = _read_pending()
-        if live and live.get("expires_at", 0) - time.time() > PENDING_REUSE_MIN:
+        if live and live.get("expires_at", 0) - time.time() > pending_reuse_min():
             return live
     status, body = _post(
         "/device/code",

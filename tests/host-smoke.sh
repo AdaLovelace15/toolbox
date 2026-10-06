@@ -17,6 +17,7 @@ REPO=$(pwd -P)
 
 NAME="smoke-$$-${RANDOM}"
 export TOOLBOX_CONTAINER=$NAME
+export TOOLBOX_NO_UPDATE=1   # never update the checkout under test
 # Nothing from the caller's environment may point the test at a real login.
 unset TOOLBOX_VOLUME TOOLBOX_WORKDIR TOOLBOX_CAPTAIN_DOMAIN TOOLBOX_ENABLE_OBSERVABILITY \
       TOOLBOX_DEX_URL TOOLBOX_CLIENT_ID TOOLBOX_BAO_UPSTREAM TOOLBOX_BAO_ROLES \

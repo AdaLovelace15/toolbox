@@ -37,6 +37,10 @@ argocd app list
 bao kv get secret/my-app
 ```
 
+When an AI agent runs `up` for you, it stops and sends you the URL and the code
+to check; approve it, then tell the agent, and it carries on. (It isn't allowed to
+wait on a login you haven't seen: agent UIs hide command output.)
+
 No flags, no `argocd login`, no `bao login`. Both CLIs behave normally —
 except that `argocd` is read-only: deployments are GitOps, so changes go
 through a pull request to the deployment repo (see
@@ -105,8 +109,11 @@ The container handles all of it, so the CLIs are just the CLIs.
 ## The `toolbox` wrapper
 
 `./toolbox` is a small host-side script that drives the container and deals with
-the environment so you don't have to. `up` starts dockerd if it's installed but
-not running, pulls the image if missing, passes proxy settings through by name,
+the environment so you don't have to. `up` (and `reauth`) first updates the
+wrapper itself — see [Staying up to date](#staying-up-to-date) — then starts dockerd if it's installed but
+not running, pulls the image on every run (and recreates a running container
+when there's a new one and nothing is running in it; the login is kept),
+passes proxy settings through by name,
 mounts the host's own CA bundle so the container trusts whatever the host trusts
 — honouring `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` or
 `NODE_EXTRA_CA_CERTS` when the environment sets one, before the system paths —
@@ -135,8 +142,26 @@ login for another cluster is discarded rather than used, as a backstop. A login
 volume another container still uses stops both, before anything is removed.
 
 **Upgrading to this version:** everyone signs in once more, because logins cached
-before didn't record their cluster - once, if the script and the image are
-upgraded together (`git pull` and `docker pull ghcr.io/glueops/toolbox:latest`).
+before didn't record their cluster - once. `up` updates the script and pulls
+the matching image itself (a clone that isn't on a clean `main` needs a
+`git pull` this once).
+
+### Staying up to date
+
+`up` and `reauth` keep both halves current:
+
+- **The wrapper:** if the `toolbox` script is in a git clone on `main` that
+  tracks a remote branch and has no local changes, `up` fast-forwards it and
+  runs again with the new version (`updated the toolbox: <old> -> <new>`). A
+  clone on another branch or a tag, with local changes or local commits, is left
+  alone with a one-line note; a copy that isn't a clone is left alone quietly.
+  It gives git 20 seconds (`TOOLBOX_UPDATE_SECONDS`) and never prompts for
+  credentials; offline, it carries on with the version it has.
+  `TOOLBOX_NO_UPDATE=1` turns this off — pin a version by checking out its tag.
+- **The image:** pulled on every run, as above.
+
+Updating runs code from the clone's remote, just as pulling `:latest` runs the
+image built from it: point the clone at a remote you trust.
 A container started with `TOOLBOX_CONTAINER` set now gets its own
 `glueops-<name>` volume instead of sharing `glueops-toolbox`; if an old container
 still uses the shared volume, remove it (`docker rm -f <name>`).
@@ -149,14 +174,21 @@ can be rendered with `./toolbox helm template …` using relative paths. Running
 the new mount; the login is kept.
 
 It also notices when it's being driven by an agent (Claude Code sets
-`CLAUDECODE`; otherwise, no terminal): then `up` prints the next step after the
-URL and `wait` returns after ~90s so it fits under a tool's command timeout. At a
+`CLAUDECODE`; otherwise, no terminal): then `up` tells the agent to stop and send
+you the URL and code, and `wait` polls for about 15 s — if you haven't approved,
+it exits 2 and hands the URL over again (a fresh code if needed). At a
 terminal, `up` opens the browser and `wait` blocks until you've approved.
+A script without a terminal gets the agent behaviour: loop on `wait` while it
+exits 2, with a deadline of your own — an expired code is replaced with a new
+one, so the loop never ends by itself — or poll longer with
+`TOOLBOX_WAIT_SECONDS=300 ./toolbox wait`. In a one-shot agent run
+(`claude -p`, `codex exec`) the run ends with the URL: approve it, then resume
+the session with "done".
 
 | | |
 |---|---|
 | `./toolbox up <domain>` | start (or reuse) the container, print the login URL |
-| `./toolbox wait` | wait for approval; exit 2 means call again |
+| `./toolbox wait` | wait for approval; exit 2 means not yet (for an agent: hand the URL over again) |
 | `./toolbox <command…>` | run it in the container: `./toolbox bao kv list secret/` |
 | `./toolbox shell` | interactive shell |
 | `./toolbox status` | running? logged in? |
@@ -178,7 +210,7 @@ container variable below is passed through if set.
 | `helm …` | Helm 3, the version ArgoCD's server renders with. For `helm template` of the deployment repo before pushing a change. |
 | `dyff …` | Kubernetes-aware YAML diff: `dyff between old.yaml new.yaml`. |
 | `toolbox-app <app>` | Where an app's config lives: value files in override order, the `file:line` that sets `image.tag`, running images. |
-| `toolbox-preflight <app> --rev <rev>` | ArgoCD's render of a pushed branch or commit vs. its render of where that branch started. Exit 0 no change, 1 change, 2 error. Secret contents are never printed. |
+| `toolbox-preflight <app> --rev <rev>` | ArgoCD's render of a pushed branch or commit vs. its render of where that branch started. Exit 0 no change, 1 change, 2 error. Also exit 1 when an app's render has a Secret and nothing else visibly changed (ArgoCD masks Secret values, so it can't tell). `--diff` prints the rendered manifest diff that `propose` puts in the PR: Secret values hidden, and only a summary for plugin-rendered apps, values or templates from outside the repo, or a suspected credential. |
 | `toolbox-watch <app> --rev <sha>` | After a merge, poll every 10 s until ArgoCD's automatic sync deploys it, then report health. Never syncs. Exit 0 healthy, 3 not yet, 4 deployed and failing, 2 tool error. |
 | `bao …` | OpenBao CLI, pointed at a local proxy that attaches your token. |
 | `toolbox-login` | Authenticate. Runs automatically on an interactive start. |
@@ -203,7 +235,10 @@ container variable below is passed through if set.
 | `TOOLBOX_PROXY_PORT` | `8200` | Loopback port the OpenBao proxy listens on |
 | `TOOLBOX_TOKEN_CACHE` | `~/.config/glueops/toolbox-token.json` | |
 | `TOOLBOX_EXTRA_CA` | — | Path to a mounted CA certificate to trust, for networks that terminate TLS at an egress proxy. Appended to the system store, so public CAs keep working. |
-| `TOOLBOX_WAIT_SECONDS` | `90` | How long one `toolbox-login --wait` call waits before returning exit 2 |
+| `TOOLBOX_WAIT_SECONDS` | `90`; `15` for `./toolbox wait` without a terminal | How long one wait polls before returning exit 2. For `./toolbox wait`, set on `wait` itself (or on `up`) |
+| `TOOLBOX_NO_UPDATE` | — | `1`: `up` doesn't update the wrapper's own clone ([Staying up to date](#staying-up-to-date)) |
+| `TOOLBOX_UPDATE_SECONDS` | `20` | How long `up` gives git to check for a newer wrapper |
+| `TOOLBOX_PULL_SECONDS` | `120` | How long `up` lets `docker pull` run when a copy of the image is already here, before using that copy |
 | `TOOLBOX_IDLE_SECONDS` | `14400` | How long a bare `docker run -d` container stays up |
 | `TOOLBOX_BAO_ROLES` | `editor,reader` | OpenBao roles tried at login, in order |
 | `TOOLBOX_BAO_AUTH_PATH` | `jwt` | OpenBao auth mount the CLI logs in through |
@@ -312,6 +347,20 @@ settings make them hold for everyone:
   `exec`. The wrapper's guard is a guardrail, not a boundary: the token is still
   reachable inside the container. Note that RBAC cannot stop a refresh, since any
   `get` permission can ask for one.
+
+### Reading a `propose` PR
+
+- **The first lines** sum it up: how many apps and resources change, what
+  merging does (automatic or manual sync, prune), and **Warnings** — deletions,
+  immutable fields that will fail the sync, scale-downs, PDB and ingress
+  changes, floating image tags, prod changed together with non-prod. "None of
+  the automatic checks fired" is not an all-clear: the checks don't judge
+  config values.
+- **Intent** is what the agent (or person) wrote; it isn't verified.
+- **What changes** is ArgoCD's rendered manifest diff per app — what the
+  change does to the cluster. The values diff is in the Files tab.
+- **How this was rendered** has the commits, ArgoCD and chart versions, and
+  the commands to reproduce the diff yourself.
 
 ## Known risks
 

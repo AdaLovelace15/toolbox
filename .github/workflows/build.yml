@@ -110,6 +110,17 @@ jobs:
         if: github.event_name == 'pull_request'
         run: bash tests/wrapper-messages.sh
 
+      # propose hands the PR body to gh on stdin: a rendered diff can be too
+      # big for an argument.
+      - name: Propose body
+        if: github.event_name == 'pull_request'
+        run: bash tests/propose-body.sh
+
+      # up fast-forwards the wrapper's own clone, only from a clean main.
+      - name: Self-update
+        if: github.event_name == 'pull_request'
+        run: bash tests/self-update.sh
+
       - name: Host smoke test
         if: github.event_name == 'pull_request'
         env:
@@ -139,3 +150,5 @@ jobs:
         run: |
           /bin/bash --version | head -1
           /bin/bash tests/wrapper-messages.sh
+          /bin/bash tests/propose-body.sh
+          /bin/bash tests/self-update.sh

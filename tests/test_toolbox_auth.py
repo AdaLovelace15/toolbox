@@ -122,6 +122,22 @@ class ClusterScopedLogin(unittest.TestCase):
         self.assertIsNone(tok)
         self.assertEqual(calls, [])
 
+    def test_a_resent_code_needs_time_left_or_is_replaced(self):
+        ta._write_private_json(ta.pending_path(), {"device_code": "old", "cluster": ta.cluster_id(),
+                                                   "expires_at": time.time() + 90})
+        posts = []
+        saved = ta._post
+        ta._post = lambda path, data: posts.append(path) or (200, {
+            "device_code": "new", "user_code": "N", "verification_uri_complete": "https://x", "expires_in": 300})
+        try:
+            self.assertEqual(ta.begin_device_flow()["device_code"], "old")       # 90 s left is enough by default
+            os.environ["TOOLBOX_PENDING_MIN_LEFT"] = "120"                      # what the wrapper asks for a re-send
+            self.assertEqual(ta.begin_device_flow()["device_code"], "new")
+        finally:
+            ta._post = saved
+            os.environ.pop("TOOLBOX_PENDING_MIN_LEFT", None)
+        self.assertEqual(posts, ["/device/code"])
+
     def test_current_pending_code_survives_a_stale_cache(self):
         ta._write_private_json(ta.cache_path(), {"id_token": "x"})   # pre-upgrade cache
         ta._write_private_json(ta.pending_path(), {"device_code": "d", "cluster": ta.cluster_id(),

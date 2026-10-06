@@ -28,6 +28,8 @@ case "$1" in
     [ -n "${STUB_RUNNING:-}" ] || exit 1
     case "$a" in
       *State.Running*) echo true ;;
+      *"{{.Image}}"*) echo "${STUB_CONTAINER_IMAGE:-sha256:new}" ;;
+      *ExecIDs*) echo "${STUB_EXECS:-0}" ;;
       *Config.Env*) echo "TOOLBOX_CAPTAIN_DOMAIN=$STUB_DOMAIN" ;;
       *Config.Labels*) echo "$STUB_WORKDIR" ;;
       *Mounts*) echo "$STUB_VOLUME" ;;
@@ -41,9 +43,38 @@ case "$1" in
         case "$a" in *toolbox.cluster*) echo "$STUB_DOMAIN" ;; *toolbox.login*) echo 1 ;; *) echo '[{}]' ;; esac ;;
       *) exit 0 ;;
     esac ;;
-  image|rm|pull|ps) exit 0 ;;
+  image)
+    [ -z "${STUB_NO_IMAGE:-}" ] || exit 1
+    case "$a" in
+      *"{{.Id}}"*) if [ -n "${STUB_NEW_ID:-}" ] && [ -e "$STUB_DIR/pulled" ]; then echo "$STUB_NEW_ID"; else echo sha256:new; fi ;;
+      *RepoTags*) echo 0 ;;
+    esac ;;
+  pull)
+    [ -z "${STUB_DIR:-}" ] || { echo "pull $*" >>"$STUB_DIR/execs"; : >"$STUB_DIR/pulled"; }
+    sleep "${STUB_PULL_SLEEP:-0}"
+    [ "${STUB_PULL_RC:-0}" = 0 ] || echo "Error response from daemon: Get \"https://ghcr.io/v2/\": dial tcp: i/o timeout" >&2
+    exit "${STUB_PULL_RC:-0}" ;;
+  rm|ps) exit 0 ;;
   run) if [ -n "${STUB_RUN_ERR:-}" ]; then printf '%s\n' "$STUB_RUN_ERR" >&2; exit 125; fi; echo 0123abcd ;;
-  exec) case "$a" in *"test -f"*) exit 0 ;; *) exit 1 ;; esac ;;   # login/probe fail: stop offline
+  exec)
+    case "$a" in
+      *"test -f"*) exit 0 ;;
+      *"toolbox-login --check"*) exit "${STUB_PROBE_RC:-1}" ;;
+      *"toolbox-login --begin"*)   # STUB_LOGIN=url: a login is needed; =done: logged in; else Dex is unreachable
+        if [ "${STUB_LOGIN:-}" = done ]; then echo "Already authenticated." >&2; exit 0; fi
+        [ "${STUB_LOGIN:-}" = url ] || exit 1
+        [ -z "${STUB_DIR:-}" ] || printf '%s\n' "$a" >>"$STUB_DIR/execs"
+        printf '%s\ncode WXYZ-ABCD - expires in %s\n' "${STUB_LOGIN_URL:-https://dex.a.example.com/device/auth/verify_code?user_code=WXYZ-ABCD}" "${STUB_LEFT:-4 min 59 s}" ;;
+      *"toolbox-login --wait"*)
+        printf '%s\n' "$a" >>"$STUB_DIR/execs"
+        case "${STUB_WAIT_RC:-0}" in
+          0) echo "Authenticated." >&2; echo "OpenBao: logged in as editor." >&2 ;;
+          1) echo "${STUB_WAIT_ERR:-toolbox: the code expired before it was approved - run toolbox-login --begin again}" >&2 ;;
+          2) echo "still waiting for approval - run 'toolbox-login --wait' again (code valid for 200 more seconds)" >&2 ;;
+        esac
+        exit "${STUB_WAIT_RC:-0}" ;;
+      *) exit 1 ;;   # login/probe fail: stop offline
+    esac ;;
   *) echo "stub docker: unexpected: $*" >&2; exit 99 ;;
 esac
 EOF
@@ -77,7 +108,7 @@ run() {  # PATH-dir, env assignments..., -- toolbox args...
     done; shift
     (cd "$WD" && env -u DOCKER_HOST -u DOCKER_DEFAULT_PLATFORM -u TOOLBOX_WORKDIR -u TOOLBOX_VOLUME \
         -u TOOLBOX_DEX_URL -u TOOLBOX_CLIENT_ID -u TOOLBOX_CAPTAIN_DOMAIN -u TOOLBOX_ENABLE_OBSERVABILITY \
-        ${unsets[@]+"${unsets[@]}"} PATH="$pathdir" CLAUDECODE=1 TOOLBOX_CONTAINER="$NAME" TOOLBOX_GROUP_FILE="$GROUPS_FILE" \
+        ${unsets[@]+"${unsets[@]}"} PATH="$pathdir" CLAUDECODE=1 TOOLBOX_NO_UPDATE=1 TOOLBOX_CONTAINER="$NAME" TOOLBOX_GROUP_FILE="$GROUPS_FILE" \
         ${envs[@]+"${envs[@]}"} bash "$TB" "$@" </dev/null 2>&1)
 }
 expect() {  # description, output, needle... (all literal substrings)
@@ -162,10 +193,74 @@ refute "...but help still works" "$out" "aren't supported"
 out=$(run "$P" STUB_RUNNING=1 STUB_DOMAIN=a.example.com "STUB_WORKDIR=$WD" "STUB_VOLUME=glueops-$NAME" -- up a.example.com)
 expect "a running container that can't log in is recreated" "$out" "reusing the running container" "the running container can't log in; recreating it" "network: bridge"
 
+# --- an agent hands the login over by ending its turn -----------------------------------------
+RUNNING=(STUB_RUNNING=1 STUB_DOMAIN=a.example.com "STUB_WORKDIR=$WD" "STUB_VOLUME=glueops-$NAME" "STUB_DIR=$S")
+: >"$S/execs"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url -- up a.example.com)
+TBQ=$(printf '%q' "$TB")
+expect "up hands the URL and code over" "$out" "LOGIN NEEDED" "End your turn now with the 2 lines below, word for word" \
+    "
+Open https://dex.a.example.com/device/auth/verify_code?user_code=WXYZ-ABCD
+That page shows the code WXYZ-ABCD. Approve with GitHub only if you just asked me to sign in to a.example.com, then reply here. It's valid for about 4 minutes.
+" "Heads-up: the GlueOps toolbox is beta." "If you are a subagent" \
+    "Only after the human replies - not in this turn - run: $TBQ wait && $TBQ <command>"
+expect "...and asks for a code with time left" "$(cat "$S/execs" 2>/dev/null)" "TOOLBOX_PENDING_MIN_LEFT=120"
+out=$(run "$P" "${RUNNING[@]}" "STUB_LOGIN_URL=https://dex.evil.example/device?user_code=ATTK-CODE" STUB_LOGIN=url -- up a.example.com; echo "rc=$?")
+expect "a URL on another host is never handed over" "$out" "the login URL is on 'dex.evil.example', not 'dex.a.example.com'"
+refute "...no LOGIN NEEDED" "$out" "LOGIN NEEDED"
+refute "...and up fails" "$out" "rc=0"
+refute "...and no longer says to wait in the same turn" "$out" "write that URL into your reply"
+refute "...and the lines to send carry no prefix" "$out" "toolbox: Open https"
+: >"$S/execs"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url STUB_WAIT_RC=2 -- wait; echo "rc=$?")
+expect "an unapproved wait hands the URL over again" "$out" "not approved yet" "Don't retry, sleep or poll" "LOGIN NEEDED" "WXYZ-ABCD" "rc=2"
+refute "...without telling the agent to just rerun" "$out" "run 'toolbox-login --wait' again"
+expect "...after a short poll" "$(cat "$S/execs")" "TOOLBOX_WAIT_SECONDS=15" "TOOLBOX_HTTP_RETRIES=2"
+expect "...and a re-sent code has two minutes left, or is replaced" "$(cat "$S/execs")" "TOOLBOX_PENDING_MIN_LEFT=120"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url -- reauth a.example.com)
+expect "reauth's private-window hint is inside the message" "$out" "End your turn now with the 3 lines below" "valid for about 4 minutes.
+To sign in as someone else, open it in a private window, or sign out of GitHub first.
+"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url "STUB_LEFT=1 min 30 s" -- up a.example.com)
+expect "a short code says about 1 minute" "$out" "It's valid for about 1 minute."
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url STUB_WAIT_RC=1 -- wait; echo "rc=$?")
+expect "an expired code gets a new handover" "$out" "that login is over (the code expired before it was approved); here is a new one:" "LOGIN NEEDED" "rc=2"
+refute "...without the container's internal command" "$out" "toolbox-login --begin"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url STUB_WAIT_RC=1 "STUB_WAIT_ERR=toolbox: login access_denied: denied - run toolbox-login --begin again" -- wait; echo "rc=$?")
+expect "...and so does a denied one" "$out" "that login is over (login access_denied: denied)" "LOGIN NEEDED" "rc=2"
+out=$(run "$P" "${RUNNING[@]}" STUB_WAIT_RC=1 "STUB_WAIT_ERR=toolbox: Dex unreachable" -- wait; echo "rc=$?")
+expect "other failures pass through" "$out" "Dex unreachable" "rc=1"
+refute "...without a handover" "$out" "LOGIN NEEDED"
+out=$(run "$P" "${RUNNING[@]}" -- wait; echo "rc=$?")
+expect "an approved login just passes" "$out" "Authenticated." "BETA - argocd and bao only" "rc=0"
+
+# --- every up pulls the image ---------------------------------------------------------------
+: >"$S/execs"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url -- up a.example.com)
+expect "up pulls even when the image is here" "$(cat "$S/execs")" "pull -q ghcr.io/glueops/toolbox:latest"
+expect "...and reuses a container already on it" "$out" "reusing the running container"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url STUB_CONTAINER_IMAGE=sha256:old -- up a.example.com)
+expect "a container on an older image is recreated" "$out" "running container is on an older ghcr.io/glueops/toolbox:latest; recreating it with the new one (the login is kept)"
+refute "...not reused" "$out" "reusing the running container"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url STUB_CONTAINER_IMAGE=sha256:old STUB_EXECS=2 -- up a.example.com)
+expect "...unless commands are running in it" "$out" "reusing the running container" "commands are running in the container, so it keeps the old one"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url STUB_PULL_RC=1 -- up a.example.com)
+expect "a failed pull falls back to the local copy" "$out" "couldn't pull ghcr.io/glueops/toolbox:latest" "using the copy already here" "LOGIN NEEDED"
+out=$(run "$P" "STUB_DIR=$S" STUB_NO_IMAGE=1 STUB_PULL_RC=1 -- up a.example.com; echo "rc=$?")
+expect "no image and no pull stops" "$out" "about 400 MB the first time" "i/o timeout" "there is no copy here" "docker's own proxy settings"
+refute "...with an error" "$out" "rc=0"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url STUB_PULL_SLEEP=3 TOOLBOX_PULL_SECONDS=1 -- up a.example.com)
+expect "a pull that hangs gives up and uses the copy here" "$out" "couldn't pull ghcr.io/glueops/toolbox:latest in time" "LOGIN NEEDED"
+rm -f "$S/pulled"
+out=$(run "$P" "${RUNNING[@]}" STUB_LOGIN=url STUB_NEW_ID=sha256:0123456789abcdef -- up a.example.com)
+expect "a new image is named" "$out" "new ghcr.io/glueops/toolbox:latest: sha256:0123456789ab (was sha256:new)"
+out=$(run "$P" "STUB_DIR=$S" STUB_LOGIN=done STUB_PROBE_RC=0 -- up a.example.com)
+expect "a new container on a cached login logs OpenBao in again" "$out" "Already authenticated." "OpenBao: logged in as editor."
+
 # --- the stop line is for agents only ----------------------------------------------------------
 if command -v script >/dev/null 2>&1 && script -qec true /dev/null >/dev/null 2>&1; then
     out=$(cd "$WD" && env -u CLAUDECODE PATH="$P" TOOLBOX_CONTAINER="$NAME" "STUB_DAEMON_ERR=$DOWN" \
-          script -qec "bash '$TB' up a.example.com" /dev/null 2>&1 | tr -d '\r')
+          script -qec "TOOLBOX_NO_UPDATE=1 bash '$TB' up a.example.com" /dev/null 2>&1 | tr -d '\r')
     expect "a human at a terminal gets the remedy" "$out" "ask the human to: sudo service docker start"
     refute "...without the agents' stop line" "$out" "$STOP"
 else

@@ -168,21 +168,22 @@ class Compare(unittest.TestCase):
     def test_same(self):
         self.assertFalse(td.compare(SERVICE, SERVICE).any)
 
-    def test_secret_change_counts_but_never_shows(self):
+    def test_secret_values_never_show_but_keys_do(self):
         ch = td.compare(SERVICE + secret("hunter2"), SERVICE + secret("s3cr3t-new"))
-        self.assertTrue(ch.any)
-        self.assertEqual(ch.secrets, [("~", "Secret/nonprod/creds")])
-        text = "\n".join(td.summary_lines("x", ch))
-        self.assertIn("contents not shown", text)
-        for leak in ("hunter2", "s3cr3t-new", "password"):
-            self.assertNotIn(leak, text)
-        self.assertFalse(td.compare(secret("same"), secret("same")).any)
+        self.assertEqual(ch.changed, ["Secret/nonprod/creds"])
+        [(_, text)] = td.rendered_diff(secret("hunter2"), secret("s3cr3t-new"))
+        self.assertIn("Secret values changed (not shown)", text)
+        self.assertNotIn("hunter2", text)
+        [(k, text)] = td.rendered_diff(SERVICE, SERVICE + secret("hunter2"))
+        self.assertIn("+  password: <hidden>", text)
+        self.assertNotIn("hunter2", text)
 
-    def test_secret_inside_list_is_redacted(self):
-        lst = "apiVersion: v1\nkind: List\nitems:\n- " + secret("hunter2").replace("---\n", "").replace("\n", "\n  ")
+    def test_masked_secret_found_inside_a_list(self):
+        lst = "apiVersion: v1\nkind: List\nitems:\n- " + secret("'++++++++'").replace("---\n", "").replace("\n", "\n  ")
         docs = td.load_docs(lst)
         self.assertEqual([d["kind"] for d in docs], ["Secret"])
-        self.assertEqual(td.redact(docs), [])
+        self.assertEqual(td.masked_secrets(docs), ["Secret/nonprod/creds"])
+        self.assertEqual(td.masked_secrets(td.load_docs(secret("hunter2"))), [])
 
     def test_changed_fields_named_without_values(self):
         ch = td.compare(deployment("r/api:v1", replicas=2), deployment("r/api:v1", replicas=3))
@@ -492,13 +493,6 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(td.normalize_url("https://github.com:443/acme/r.git"), "github.com/acme/r")
         self.assertEqual(td.normalize_url("ssh://git@github.com:22/acme/r"), "github.com/acme/r")
         self.assertEqual(td.normalize_url("ssh://git@git.example.com:2222/acme/r"), "git.example.com:2222/acme/r")
-
-    def test_redact_values_diff(self):
-        diff = "+  POSTGRES_PASSWORD: hunter2\n+  - name: DB_TOKEN\n+    value: abc\n+  replicas: 3\n"
-        out = td.redact_diff(diff)
-        self.assertNotIn("hunter2", out)
-        self.assertNotIn("abc", out)
-        self.assertIn("replicas: 3", out)
 
     def test_image_tag_in_app_spec(self):
         lay = td.parse_layout(app([dict(CHART, helm={"parameters": [{"name": "image.tag", "value": "v9"}]})]))
