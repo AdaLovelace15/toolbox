@@ -98,9 +98,11 @@ check "observability CLI refused (exit 5)" '[ $rc = 5 ]'
 out=$(./toolbox status 2>&1); rc=$?
 check "status exits 0 and names the login volume and its cluster" '[ $rc = 0 ] && has "$out" "login volume: $VOL ($A)"'
 
-id=$(cid)
+created=$(docker volume inspect -f '{{.CreatedAt}}' "$VOL" 2>/dev/null)
 out=$(./toolbox up " https://SMOKE-A.invalid./x" 2>&1)
-check "a pasted variant of the same domain is the same cluster" 'has "$out" "captain domain: $A (from" && has "$out" "reusing the running container" && ! has "$out" "switching cluster" && [ -n "$id" ] && [ "$(cid)" = "$id" ]'
+# Same cluster: the container is reused (and, since this domain's Dex is
+# unreachable, recreated after its login fails) - but the login is never wiped.
+check "a pasted variant of the same domain is the same cluster" 'has "$out" "captain domain: $A (from" && has "$out" "reusing the running container" && ! has "$out" "switching cluster" && ! has "$out" "removed:" && [ -n "$created" ] && [ "$(docker volume inspect -f "{{.CreatedAt}}" "$VOL" 2>/dev/null)" = "$created" ] && [ "$(label "$VOL")" = "$A" ]'
 
 echo "# up $B (cluster switch, container present)"
 out=$(./toolbox up "$B" 2>&1)

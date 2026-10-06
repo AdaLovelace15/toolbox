@@ -27,4 +27,21 @@ for phrase in "Never sync|never sync" "even if the human asks" "argocd app logs 
     else echo "FAIL  toolbox brief rules lost: $phrase"; fail=1; fi
 done
 
+# Every way `up` stops is explained to agents in AGENTS.md "If `up` fails" - the
+# message keys, joined across line breaks. Keys are plain ASCII on purpose.
+section=$(sed -n '/^## If `up` fails/,/^## Do not/p' AGENTS.md | tr '\n' ' ' | tr -s ' ')
+for key in "ask the human to" "docker is not installed" "cannot connect to the docker daemon" \
+           "the docker daemon can't see" "this docker is Podman" "dockerd did not come up" \
+           "no network egress at all" "a proxy intercepts TLS" \
+           "Windows shells (Git Bash, MSYS, Cygwin) aren't supported"; do
+    if ! grep -qF -- "$key" toolbox; then echo "FAIL  toolbox no longer says: $key"; fail=1
+    else
+        case "$section" in
+            *"$key"*) echo "ok    AGENTS.md 'If up fails' covers: $key" ;;
+            *) echo "FAIL  AGENTS.md 'If up fails' doesn't cover: $key"; fail=1 ;;
+        esac
+    fi
+done
+case "$section" in *'bash\r'*) echo "ok    AGENTS.md 'If up fails' covers: CRLF (bash\r)" ;; *) echo "FAIL  AGENTS.md doesn't cover CRLF (bash\r)"; fail=1 ;; esac
+
 exit "$fail"

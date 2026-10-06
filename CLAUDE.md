@@ -52,7 +52,9 @@ that directory is mounted read-only into the container.
 ./toolbox up <captain-domain>
 ```
 
-It prints a URL. Write it into your reply — a human approves it in a browser and
+Give it a Bash `timeout: 600000`: the first run downloads a large image, and
+network fallbacks can take minutes. If it's still cut off, run the same command
+again. It prints a URL. Write it into your reply — a human approves it in a browser and
 the code expires in five minutes — then, in the same turn:
 
 ```bash
@@ -64,15 +66,17 @@ If `wait` says `still waiting` (exit 2), run it again. Every later command is
 Asked to log in again, as someone else, or to another cluster? Run
 `./toolbox reauth [<captain-domain>]`: it wipes the cached login and starts over.
 Show its URL and `wait` as above. Only when asked — a failed command is not a
-reason to run it. If the human only suspects the login is broken, run `./toolbox status` first:
-`not authenticated` means `./toolbox up <domain>` (no wipe needed); `authenticated`
-means the failure is something else — report it, and offer `reauth`. `up` for a
-different domain also wipes the old login.
+reason to run it. If the human only suspects the login is broken, run
+`./toolbox status` first: `not authenticated` means `./toolbox up <domain>` (no
+wipe needed); `authenticated` means the failure is something else — report it,
+and offer `reauth`. `up` for a different domain also wipes the old login.
 
 On Windows, the toolbox and you must run inside WSL2; if `up` says Windows
 shells aren't supported, say so and stop. `up` handles the environment itself —
-starting dockerd, proxies, CAs, host networking — and prints what it decided. Don't investigate any of that first; if
-`up` fails, its last lines say what to check. Everything else is in
+starting dockerd, proxies, CAs, host networking — and prints what it decided.
+Don't investigate any of that first; if `up` fails, its last lines say what's
+wrong, and a line saying `ask the human to` is theirs to do: pass it on and
+stop. Everything else is in
 [AGENTS.md](AGENTS.md). The rules above always apply; AGENTS.md has the
 details, and what to do if a step fails.
 

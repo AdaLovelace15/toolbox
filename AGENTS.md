@@ -61,6 +61,7 @@ Two commands. Everything below them is reference — read it only if one fails.
 ```bash
 # 1. start the container and get the login URL
 #    (ask the human for the captain domain if you weren't given one)
+#    give it a 10-minute command timeout (Claude Code: timeout: 600000)
 ./toolbox up <captain-domain>
 ```
 
@@ -69,7 +70,8 @@ run step 2 in the same turn. The human approves it in a browser; they cannot
 approve what they have not seen, and the code expires five minutes after it is
 issued. Never fold `up` and `wait` into one command — the human must see the
 URL before you start waiting on it. If `up` prints `Already authenticated.`
-there is nothing to approve; go straight to step 2.
+there is nothing to approve; go straight to step 2. If your tool cuts `up` off,
+run the same `up` again; it carries on.
 
 ```bash
 # 2. wait for the approval, then run whatever you were asked
@@ -80,15 +82,17 @@ there is nothing to approve; go straight to step 2.
 cluster? `./toolbox reauth [<captain-domain>]` removes the container and its login
 volume — every cached token and half-finished login — and runs `up` from scratch:
 show the new URL, then `./toolbox wait`. To sign in as someone else, the human
-opens the URL in a private window or signs out of GitHub first. If the human only suspects the login is broken, run `./toolbox status` first:
-`not authenticated` means `./toolbox up <domain>` (no wipe needed); `authenticated`
-means the failure is something else — report it, and offer `reauth`.
-The toolbox serves one cluster at a time; `up` for a different domain does the
-same removal by itself.
+opens the URL in a private window or signs out of GitHub first. If the human
+only suspects the login is broken, run `./toolbox status` first: `not
+authenticated` means `./toolbox up <domain>` (no wipe needed); `authenticated`
+means the failure is something else — report it, and offer `reauth`. The
+toolbox serves one cluster at a time; `up` for a different domain does the same
+removal by itself.
 
 `wait` returns after about 90 seconds if the human hasn't approved yet, so it
-fits under your tool's command timeout: exit code 2 and `still waiting` mean run
-it again, nothing is wrong. Once approved it logs you into OpenBao too. Every
+fits under your tool's command timeout (if yours is shorter, set
+`TOOLBOX_WAIT_SECONDS` on `up`): exit code 2 and `still waiting` mean run it
+again, nothing is wrong. Once approved it logs you into OpenBao too. Every
 later command is `./toolbox <command>`.
 
 **`up` owns the environment.** It starts dockerd if it's installed but not
@@ -105,15 +109,24 @@ exactly what it couldn't do.
 
 ## If `up` fails
 
-Its last lines say what happened. The cases:
+Its last lines say what happened. A line starting `toolbox: ask the human to`
+is a step only the human can take — installing or starting docker, group
+changes, `sudo`, moving a clone, a sandbox setting. Give them that line and
+stop: don't do it yourself, and don't retry from another directory or with
+plain `docker`. That covers `docker is not installed`, `cannot connect to the
+docker daemon`, docker permission problems and `the docker daemon can't see`
+a path. The other cases:
 
 - **`Windows shells (Git Bash, MSYS, Cygwin) aren't supported`** — you are
   running natively on Windows. The toolbox only runs inside WSL2. Run nothing
   else; tell the human to start their agent inside WSL and clone there
   ([HUMANS.md](HUMANS.md#windows)).
-- **`docker is not installed`** / **`cannot connect to the docker daemon`** and
-  you are not root — you need docker, or a user that can reach it. Nothing in
-  this repo can fix that; tell the human.
+- **`bash\r`** (`/usr/bin/env: 'bash\r': No such file or directory`) or
+  **`$'\r': command not found`** — this clone has Windows line endings. Don't
+  convert, edit or re-clone anything; tell the human to clone it again inside
+  WSL ([HUMANS.md](HUMANS.md#windows)).
+- **`this docker is Podman`** — untested. If anything after it fails, say so and
+  stop.
 - **`dockerd did not come up`** — `cat /tmp/toolbox-dockerd.log`.
 - **`no network egress at all`** after both networks — this host can't reach the
   internet from a container. If the host needs a proxy, `export HTTPS_PROXY`
@@ -230,8 +243,10 @@ login, `./toolbox reauth`.
 
 Everything runs as `./toolbox <command>`; the rest of this section shows just
 the command. Arguments are passed through intact, so quote as you normally would.
-For a pipeline or a script, wrap it: `./toolbox bash -c 'argocd app list -o json | ...'`
-so the container's environment applies throughout.
+For a pipeline or a script, wrap it: `./toolbox bash -c 'argocd app list -o json | jq ...'`,
+so the container's environment and tools (`jq`, `python3`, GNU coreutils) apply
+throughout - the host may lack them or, on macOS, have BSD versions. `git` and
+`gh` stay on the host.
 
 ```bash
 ./toolbox argocd app list
@@ -279,13 +294,14 @@ Run `up` from a directory that contains both this repo and the deployment repo
 clone (their common parent, say): it is mounted read-only at the same path, and
 `./toolbox` commands start in your current directory, so relative paths work
 inside the container. Work from inside the clone. `git` and `gh` stay on the
-host. Below, `<toolbox>` is the path to the wrapper from the clone, e.g.
+host, logged in as the human: if `propose` says `ask the human`, pass it on and
+stop - don't log in for them or push another way. Below, `<toolbox>` is the path to the wrapper from the clone, e.g.
 `../toolbox/toolbox`.
 
 | | |
 |---|---|
 | `<toolbox> toolbox-app <app>` | where the config lives: chart, deployment repo and its source position, value files in override order, the `file:line` setting `image.tag` (`<- effective` marks the winner; a tag set in the app spec itself is called out), running images. `--json` |
-| `<toolbox> propose -m "<why>"` | **host side.** Branch, commit, push the branch, have ArgoCD render it for every affected app, open (or update) the PR — then stop. Exit `0` PR opened/updated, `3` no change (no PR), `2` failed (no PR), `1` usage |
+| `<toolbox> propose -m "<why>"` | **host side.** Branch, commit, push the branch, have ArgoCD render it for every affected app, open (or update) the PR — then stop. Exit `0` PR opened/updated, `3` no change (no PR), `2` failed (no PR), `1` usage or setup (no PR) |
 | `<toolbox> propose --revert <merge-sha>` | the same for reverting a merged change |
 | `<toolbox> toolbox-preflight <app> --rev <branch\|sha>` | ArgoCD's render of a pushed revision vs. its render of where that branch left the tracked branch — `0` no change, `1` change, `2` error. `propose` runs it for you |
 | `<toolbox> toolbox-watch <app> --rev <merge-sha>` | after a merge: polls every 10 s until ArgoCD's automatic sync deploys it, then for health — `0` healthy, `3` not there yet, `4` deployed and failing, `2` the tool failed |
