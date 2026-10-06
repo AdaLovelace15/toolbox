@@ -52,20 +52,20 @@ RUN set -eux; \
     curl -fsSL -o /tmp/prom.tar.gz \
       "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-${TARGETARCH}.tar.gz"; \
     tar -xzf /tmp/prom.tar.gz --strip-components=1 -C /usr/local/bin --wildcards '*/promtool'; \
-    mv /usr/local/bin/promtool /usr/local/bin/promtool.real; \
-    chmod +x /usr/local/bin/promtool.real; \
+    mv /usr/local/bin/promtool /usr/local/libexec/toolbox/promtool.real; \
+    chmod +x /usr/local/libexec/toolbox/promtool.real; \
     rm -f /tmp/prom.tar.gz; \
-    /usr/local/bin/promtool.real --version >/dev/null
+    /usr/local/libexec/toolbox/promtool.real --version >/dev/null
 
 # logcli (logs). Ships as a zip of a single arch-suffixed binary.
 RUN set -eux; \
     curl -fsSL -o /tmp/logcli.zip \
       "https://github.com/grafana/loki/releases/download/v${LOKI_VERSION}/logcli-linux-${TARGETARCH}.zip"; \
     (cd /tmp && jar xf logcli.zip 2>/dev/null || python3 -c "import zipfile;zipfile.ZipFile('/tmp/logcli.zip').extractall('/tmp')"); \
-    mv "/tmp/logcli-linux-${TARGETARCH}" /usr/local/bin/logcli.real; \
-    chmod +x /usr/local/bin/logcli.real; \
+    mv "/tmp/logcli-linux-${TARGETARCH}" /usr/local/libexec/toolbox/logcli.real; \
+    chmod +x /usr/local/libexec/toolbox/logcli.real; \
     rm -f /tmp/logcli.zip; \
-    /usr/local/bin/logcli.real --version >/dev/null
+    /usr/local/libexec/toolbox/logcli.real --version >/dev/null
 
 # tempo-cli (traces). `query api` is a TraceQL client; the rest of the binary is
 # backend tooling we do not use.
@@ -73,9 +73,12 @@ RUN set -eux; \
     curl -fsSL -o /tmp/tempo.tar.gz \
       "https://github.com/grafana/tempo/releases/download/v${TEMPO_VERSION}/tempo_${TEMPO_VERSION}_linux_${TARGETARCH}.tar.gz"; \
     tar -xzf /tmp/tempo.tar.gz -C /usr/local/bin tempo-cli; \
-    mv /usr/local/bin/tempo-cli /usr/local/bin/tempo-cli.real; \
-    chmod +x /usr/local/bin/tempo-cli.real; \
-    rm -f /tmp/tempo.tar.gz
+    mv /usr/local/bin/tempo-cli /usr/local/libexec/toolbox/tempo-cli.real; \
+    chmod +x /usr/local/libexec/toolbox/tempo-cli.real; \
+    rm -f /tmp/tempo.tar.gz; \
+    /usr/local/libexec/toolbox/tempo-cli.real --help >/dev/null; \
+    # Owned by root, so the runtime user can't swap a gated binary for another.
+    chown -R root:root /usr/local/libexec/toolbox
 
 # helm (rendering deployment configs locally). Verified against the published
 # checksum, which sits next to the tarball.

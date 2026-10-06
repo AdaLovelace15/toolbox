@@ -12,6 +12,10 @@
 #   3. --use-grpc must NOT be used: headers then travel as gRPC metadata and never
 #      reach oauth2-proxy, so the edge rejects the request.
 set -euo pipefail
+# Switched off during the beta; see lib/observability-gate.sh.
+. /opt/toolbox/lib/observability-gate.sh || exit 5
+toolbox_observability_gate tempo-cli
+REAL=/usr/local/libexec/toolbox/tempo-cli.real
 if ! TOKEN="$(toolbox-token --no-login)"; then
     echo "toolbox: not authenticated. Run 'toolbox-login' first." >&2; exit 1
 fi
@@ -31,13 +35,13 @@ if [ "${1:-}" = "query" ] && [ "${2:-}" = "api" ]; then
     sub="${3:-}"; shift 3 || true
     case "$sub" in
       trace-id)
-        exec /usr/local/bin/tempo-cli.real query api trace-id "${HDRS[@]}" \
+        exec "$REAL" query api trace-id "${HDRS[@]}" \
              "https://${HOST}${PREFIX}" "$@" ;;
       "")
-        exec /usr/local/bin/tempo-cli.real query api --help ;;
+        exec "$REAL" query api --help ;;
       *)
-        exec /usr/local/bin/tempo-cli.real query api "$sub" --secure \
+        exec "$REAL" query api "$sub" --secure \
              --path-prefix "${PREFIX}" "${HDRS[@]}" "${HOST}" "$@" ;;
     esac
 fi
-exec /usr/local/bin/tempo-cli.real "$@"
+exec "$REAL" "$@"

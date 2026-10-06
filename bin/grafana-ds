@@ -5,6 +5,9 @@
 # generates them unless the chart pins one), so the wrappers look them up at run
 # time rather than hard-coding. Cached for the life of the container.
 set -euo pipefail
+# Switched off during the beta; see lib/observability-gate.sh.
+. /opt/toolbox/lib/observability-gate.sh || exit 5
+toolbox_observability_gate grafana-ds
 type="${1:?usage: grafana-ds <prometheus|loki|tempo>}"
 cache="${TMPDIR:-/tmp}/toolbox-ds-${type}"
 if [ -s "$cache" ]; then cat "$cache"; exit 0; fi

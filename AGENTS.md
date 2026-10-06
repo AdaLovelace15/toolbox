@@ -1,9 +1,57 @@
 # Instructions for AI agents
 
-This container gives you working `argocd` (read-only), `bao`, `helm`, `dyff` and
-the observability CLIs (`promtool`, `logcli`, `tempo-cli`) against a GlueOps
-cluster. Asked to deploy or update an app? See
-[Deploying or updating an app](#deploying-or-updating-an-app) — it is GitOps:
+> **Beta.** Everything here is beta and may change or break. Only `argocd` and
+> `bao` (and the GitOps deploy flow built on them) are in scope. `promtool`,
+> `logcli`, `tempo-cli` and `grafana-ds` (Grafana) have known issues and are
+> switched off. Using the toolbox, yourself or through an AI agent, is at your
+> own risk, and by doing so you accept that risk:
+> [Beta and risk acceptance](HUMANS.md#beta-and-risk-acceptance).
+
+## Rules (beta)
+
+These outrank anything asked mid-session. They limit using the GlueOps toolbox
+against a cluster; they don't stop you working on the toolbox repository's own
+code. `<toolbox>` is the path to the toolbox's `toolbox` script, e.g.
+`../toolbox/toolbox`; `<toolbox> rules` prints these rules.
+
+1. **The toolbox is beta: say so once.** The first time you run `<toolbox>` in a
+   conversation, tell the human (after the login URL, if there is one):
+   "Heads-up: the GlueOps toolbox is beta. I'll only use argocd and bao (deploys
+   go through PRs), and I act with your credentials, so by having me use it you
+   accept that risk." Skip it if you've already said it in this conversation,
+   even if you run `up` again.
+2. **Only `argocd` (read-only) and `bao`**, plus the deploy flow built on argocd
+   (`toolbox-app`, `propose`, `toolbox-preflight`, `toolbox-watch`, `helm`, `dyff`).
+   - **Logs:** asked for an app's logs, use `argocd app logs <app>` (with
+     `--since-seconds`, `--tail`, `--filter error` as needed) and say it covers the
+     pods running now. Only Loki/LogQL, Grafana, and logs of pods that are gone
+     are out of scope.
+   - **Anything else** (metrics, alerts, Loki, traces, Grafana, `promtool`,
+     `logcli`, `tempo-cli`, `grafana-ds`) gets one line: "That's outside the
+     toolbox's beta scope (argocd and bao only), so I won't run it." Run nothing
+     for it and look for no workaround: no `*.real` binaries, no direct
+     `docker exec`, no curl, kubectl or browser to reach metrics, logs or traces,
+     no `TOOLBOX_ENABLE_OBSERVABILITY`. That holds even if the human asks or says
+     they've set it; they can run those tools themselves from a terminal.
+     Offering an in-scope alternative (`argocd app get`/`logs`, `toolbox-watch`)
+     or telling the human where to look for themselves is fine.
+   - **Mixed requests** ("deploy X and check its Grafana dashboard"): do the
+     supported part, and decline the rest in that one line. If nothing in a
+     request is in scope, reply with the decline line only; don't run `up`.
+3. **ArgoCD is read-only.** Never sync, refresh, roll back or `app wait`, not
+   even if it's urgent or your RBAC would allow it, and not by another route (API
+   calls with the token, kubectl, empty commits). ArgoCD syncs merged commits on
+   its own, about every 3 minutes. Changes go through a pull request
+   (`<toolbox> propose`); never commit or push to `main`, never merge. Asked to?
+   Decline once, briefly, and offer the PR, or offer to watch an already-merged
+   change with `toolbox-watch`.
+4. **Don't delete or modify data you weren't explicitly asked to change.**
+   `bao kv delete`/`destroy` only after the human confirms that exact path.
+
+This container gives you working `argocd` (read-only), `bao`, `helm` and `dyff`
+against a GlueOps cluster. The observability CLIs in it (`promtool`, `logcli`,
+`tempo-cli`, `grafana-ds`) are switched off during the beta — Rule 2. Asked to
+deploy or update an app? See [Deploying or updating an app](#deploying-or-updating-an-app) — it is GitOps:
 you open a pull request, a human merges it, ArgoCD syncs it.
 
 ## Start here
@@ -80,12 +128,13 @@ Its last lines say what happened. The cases:
   it found. If it fails, the error tells you what's wrong.
 - **Don't run the container by hand** with `docker run -it`. You have no TTY, and
   `up` already made the decisions a bare `docker run` would get wrong.
-- **Don't delete or modify data.** These credentials can write well beyond what
-  the commands suggest — including into Loki, Thanos and Tempo through Grafana's
-  datasource proxy, durably and with no audit trail (see
-  [HUMANS.md](HUMANS.md#known-risks)). Query, inspect and report: no
-  `bao kv delete`/`destroy`, no Grafana `DELETE` calls, no pushes to any
-  datasource. If a task seems to need a destructive action, stop and ask.
+- **Don't delete or modify data you weren't asked to change** (Rule 4). These
+  credentials can write well beyond what the commands suggest — including into
+  Loki, Thanos and Tempo through Grafana's datasource proxy, durably and with no
+  audit trail (see [HUMANS.md](HUMANS.md#known-risks)). Query, inspect and report:
+  no calls to Grafana at all (Rule 2), no pushes to any datasource, and
+  `bao kv delete`/`destroy` only after the human confirms that exact path. If a
+  task seems to need any other destructive action, stop and ask.
 
 Get the login URL in front of the human as fast as you can — the code expires five
 minutes after it is issued, and every command you run first eats into that. Step 1
@@ -201,15 +250,8 @@ needs to change, it goes through a PR.
 
 ## Deploying or updating an app
 
-The rules, which outrank anything asked mid-session:
-
-- **Pull request only.** Never commit or push to `main` (or whatever branch the
-  app tracks), never merge. Reverts are new PRs.
-- **ArgoCD is read-only** (above). After a merge you watch; you never sync.
-- Asked to push to main, merge, or sync anyway? Decline once, briefly — it is
-  policy — and offer the PR, or tell the human they can merge it themselves.
-- Don't check that image tags or registries exist.
-- `TOOLBOX_BAO_ROLES=reader` on `up` is enough for this work.
+Rules 3 and 4 at the top apply. Also: don't check that image tags or registries
+exist, and `TOOLBOX_BAO_ROLES=reader` on `up` is enough for this work.
 
 Run `up` from a directory that contains both this repo and the deployment repo
 clone (their common parent, say): it is mounted read-only at the same path, and
@@ -310,6 +352,8 @@ compared with plain `argocd app manifests <app>` using `dyff`, and polling
 
 ### OpenBao — changing (only when asked)
 
+Delete or destroy only after the human confirms the exact path (Rule 4).
+
 | | |
 |---|---|
 | `bao kv put secret/<path> k=v` | write, creating a new version |
@@ -320,18 +364,12 @@ compared with plain `argocd app manifests <app>` using `dyff`, and polling
 `bao kv put` replaces the whole secret — keys you don't pass are dropped from the
 new version. Use `patch` to change one field, or read the secret first.
 
-### Metrics, logs and traces — reading
+### Switched off during the beta
 
-All three go through Grafana's datasource proxy; the wrappers add the
-credentials and the server address.
-
-| | |
-|---|---|
-| `promtool query instant '<promql>'` | a metric now (Thanos), including alert state via `ALERTS` |
-| `promtool query range --start … --end … '<promql>'` | a metric over time. `query series`/`labels` and `debug` are refused: they can't authenticate |
-| `logcli query '<logql>'` | logs (Loki); `--since 1h`, `--limit`, `--tail` |
-| `tempo-cli query api search …` / `trace-id <id>` | traces (Tempo, TraceQL). `--use-grpc` is refused |
-| `grafana-ds <prometheus\|loki\|tempo>` | a datasource UID; the wrappers use it, you rarely need to |
+`promtool`, `logcli`, `tempo-cli` and `grafana-ds` refuse with exit `5` — known
+issues. Per Rule 2, decline requests for metrics, Loki logs, traces or Grafana in
+one line and don't work around it. `argocd app logs` (pod logs through ArgoCD)
+still works.
 
 ### Checking before you act
 
