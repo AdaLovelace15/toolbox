@@ -8,6 +8,10 @@
 #   toolbox status                is it running, is it logged in
 #   toolbox down                  remove the container (the login cache volume is kept)
 #
+# The directory `up` runs in (or TOOLBOX_WORKDIR) is mounted read-only at the
+# same path, and commands start in your current directory, so helm can render a
+# deployment-configurations clone that lives under it.
+#
 # `up` deals with the environment so nobody has to: starts dockerd if it is
 # installed but not running, pulls the image if missing, passes proxy settings
 # through, trusts whatever CAs the host trusts, uses host networking when the
@@ -18,14 +22,36 @@ set -euo pipefail
 IMAGE="${TOOLBOX_IMAGE:-ghcr.io/glueops/toolbox:latest}"
 NAME="${TOOLBOX_CONTAINER:-toolbox}"
 VOLUME="${TOOLBOX_VOLUME:-glueops-toolbox}"
+WORKDIR_LABEL=dev.glueops.toolbox.workdir
 DOMAIN=""
+WORKDIR=""
 
 log() { printf 'toolbox: %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
 
 usage() {
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit "${1:-1}"
+}
+
+# ------------------------------------------------------------------ workdir --
+# Physical paths on both sides, so a symlinked checkout still compares equal.
+resolve_workdir() {
+    local d="${TOOLBOX_WORKDIR:-$PWD}"
+    WORKDIR=$(cd "$d" 2>/dev/null && pwd -P) || die "TOOLBOX_WORKDIR=$d is not a directory"
+    [ "$WORKDIR" != / ] || die "refusing to mount / into the container; run up from your project directory, or set TOOLBOX_WORKDIR"
+    # docker's --mount is comma-separated and quote-aware; such paths cannot be passed.
+    case "$WORKDIR" in *,*|*\"*) die "cannot mount $WORKDIR (contains a comma or quote); set TOOLBOX_WORKDIR to a parent directory without one" ;; esac
+}
+
+is_inside() {  # $1 path, $2 directory
+    [ -n "$2" ] || return 1
+    case "$1/" in "$2"/*) return 0 ;; esac
+    return 1
+}
+
+container_workdir() {
+    docker inspect -f "{{index .Config.Labels \"$WORKDIR_LABEL\"}}" "$NAME" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- docker ----
@@ -91,6 +117,12 @@ run_container() {  # $1 = bridge|host
     local net=$1 v ca port
     local args=(-d --name "$NAME" -v "$VOLUME:/home/toolbox/.config/glueops"
                 -e "TOOLBOX_CAPTAIN_DOMAIN=$DOMAIN")
+
+    # The workdir, read-only, at the same absolute path, so paths mean the same
+    # thing on both sides. --mount rather than -v: -v silently creates an empty
+    # directory when the docker daemon cannot see the source.
+    args+=(--mount "type=bind,src=$WORKDIR,dst=$WORKDIR,readonly"
+           --label "$WORKDIR_LABEL=$WORKDIR")
 
     # Passed by name so values never land in argv or the transcript: proxy URLs
     # often carry credentials.
@@ -181,15 +213,24 @@ container_domain() {
 cmd_up() {
     DOMAIN="${1:-${TOOLBOX_CAPTAIN_DOMAIN:-}}"
     [ -n "$DOMAIN" ] || die "usage: toolbox up <captain-domain>   (e.g. prod.foobar.onglueops.com)"
+    resolve_workdir
     need_docker
 
     if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
-        if [ "$(container_domain)" = "$DOMAIN" ]; then
-            log "reusing the running container"
+        local mounted
+        mounted=$(container_workdir)
+        if [ "$(container_domain)" != "$DOMAIN" ]; then
+            log "running container is for $(container_domain); replacing it"
+        elif ! is_inside "$WORKDIR" "$mounted"; then
+            # Mounts are fixed at creation. The login lives in the volume, so
+            # recreating costs nothing but any command running in it right now.
+            log "running container mounts ${mounted:-nothing}, not $WORKDIR; recreating it (the login is kept)"
+        else
+            log "reusing the running container (workdir $mounted)"
             login; return
         fi
-        log "running container is for $(container_domain); replacing it"
     fi
+    log "workdir: $WORKDIR (read-only)"
     docker rm -f "$NAME" >/dev/null 2>&1 || true
 
     if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -243,11 +284,20 @@ cmd_wait() {
 }
 
 cmd_exec() {
-    local tty=()
+    local tty=() rc
     if [ -t 0 ] && [ -t 1 ]; then tty=(-it); fi
     # bash -lc so /etc/toolbox-env.sh is sourced; arguments go through "$@" so
-    # quoting survives intact.
-    docker exec "${tty[@]}" "$NAME" bash -lc 'exec "$@"' bash "$@"
+    # quoting survives intact. Start in the caller's directory when the container
+    # can see it (the workdir is mounted at the same path), so relative paths
+    # work; a container without the mount just stays in its home directory.
+    set +e
+    docker exec "${tty[@]}" "$NAME" bash -lc 'cd "$1" 2>/dev/null; shift; exec "$@"' bash "$(pwd -P)" "$@"
+    rc=$?
+    set -e
+    if [ "$rc" = 127 ]; then
+        log "'$1' was not found in the container. If it is new, the image predates these scripts: docker pull $IMAGE && ./toolbox up <domain>"
+    fi
+    return "$rc"
 }
 
 cmd_status() {
@@ -268,7 +318,7 @@ cmd_status() {
 case "${1:-}" in
     up)      shift; cmd_up "$@" ;;
     wait)    cmd_wait ;;
-    shell)   docker exec -it "$NAME" bash -l ;;
+    shell)   docker exec -it "$NAME" bash -lc 'cd "$1" 2>/dev/null; exec bash -l' bash "$(pwd -P)" ;;
     status)  cmd_status ;;
     down)    docker rm -f "$NAME" >/dev/null 2>&1 && log "removed $NAME (volume $VOLUME kept)" ;;
     -h|--help|help|"") usage 0 ;;

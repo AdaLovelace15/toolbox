@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
-# argocd, with credentials for BOTH the edge and ArgoCD itself.
+# argocd, read-only, with credentials for BOTH the edge and ArgoCD itself.
 #
-# These are two different headers and each side reads only its own:
+# Read-only: the platform is GitOps. The cluster changes only when ArgoCD's
+# automatic sync picks up a merged commit in the deployment repo, so nothing here
+# may sync, roll back, edit or refresh - even where RBAC would allow it. A
+# refresh counts as a write: it forces a reconcile, and any `get` permission is
+# enough to ask for one, so RBAC cannot stop it. `app wait` is refused for the
+# same reason - it requests a refresh while an operation is running.
+#
+# The guard runs before a token is fetched, so a refused command never reaches
+# the server. It is a guardrail, not a security boundary: the token is still
+# reachable from inside the container.
+#
+# Credentials: two different headers, and each side reads only its own:
 #
 #   ARGOCD_AUTH_TOKEN  -> "Token: <jwt>"           ArgoCD reads this
 #   -H "Authorization" -> "Authorization: Bearer"  oauth2-proxy reads this
@@ -11,10 +22,64 @@
 # Token: empty, so ArgoCD answers "Unauthenticated: no session information".
 # It is the same Dex token in both; ArgoCD accepts it because the platform lists
 # the toolbox audience in allowedAudiences.
+#
+# Exit codes of our own: 4 not authenticated, 5 refused. Neither collides with
+# `app diff`, which uses 1 for "diff found".
 set -euo pipefail
+
+REAL=/usr/local/libexec/toolbox/argocd.real
+
+refuse() {
+    echo "toolbox: argocd is read-only here (GitOps): $1." >&2
+    echo "toolbox: changes go through a PR to the deployment repo; ArgoCD syncs merged commits on its own." >&2
+    exit 5
+}
+
+# Help never touches the server.
+if [ "$#" = 0 ]; then exec "$REAL"; fi
+for a in "$@"; do
+    case "$a" in -h|--help) exec "$REAL" "$@" ;; esac
+done
+
+for a in "$@"; do
+    case "$a" in
+        --refresh|--refresh=*|--hard-refresh|--hard-refresh=*)
+            refuse "${a%%=*} forces a reconcile; ArgoCD polls git by itself" ;;
+        # Flags that point the CLI at another server, another auth, or another
+        # mode (--core talks to the Kubernetes API directly).
+        --core|--core=*|--port-forward|--port-forward=*|--port-forward-namespace|--port-forward-namespace=*|\
+        --kube-context|--kube-context=*|--server|--server=*|--server-crt|--server-crt=*|\
+        --argocd-context|--argocd-context=*|--config|--config=*|--auth-token|--auth-token=*|\
+        -H|-H*|--header|--header=*|--plaintext|--plaintext=*|--insecure|--insecure=*|\
+        --client-crt|--client-crt=*|--client-crt-key|--client-crt-key=*|\
+        --grpc-web-root-path|--grpc-web-root-path=*)
+            refuse "${a%%=*} is not allowed" ;;
+    esac
+done
+
+# Command and subcommand must be the first two words. Global flags in front would
+# make them ambiguous (a flag may or may not take a value), so they are refused;
+# set them in ARGOCD_OPTS instead.
+case "$1" in -*) refuse "put global flags after the command, or in ARGOCD_OPTS" ;; esac
+case "$1 ${2:-}" in
+    "app list"|"app get"|"app diff"|"app manifests"|"app history"|"app resources"|\
+    "app logs"|"app get-resource"|\
+    "appset list"|"appset get"|\
+    "proj list"|"proj get"|\
+    "cluster list"|"cluster get"|\
+    "repo list"|"repo get"|\
+    "account get-user-info"|"account can-i") ;;
+    "proj windows")
+        [ "${3:-}" = list ] || refuse "'argocd proj windows ${3:-}' changes state" ;;
+    "version "*) ;;
+    *) refuse "'argocd $1${2:+ $2}' is not a read-only command" ;;
+esac
+
 if ! TOKEN="$(toolbox-token --no-login)"; then
     echo "toolbox: not authenticated. Run 'toolbox-login' first." >&2
-    exit 1
+    exit 4
 fi
 export ARGOCD_AUTH_TOKEN="$TOKEN"
-exec /usr/local/bin/argocd.real -H "Authorization: Bearer ${TOKEN}" "$@"
+# Pinned rather than inherited, so nothing can smuggle flags in through it.
+export ARGOCD_OPTS=--grpc-web
+exec "$REAL" -H "Authorization: Bearer ${TOKEN}" "$@"

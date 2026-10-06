@@ -18,10 +18,15 @@
 > everything here as read-only: query, inspect and report. Do not run `bao kv
 > delete`/`destroy`, `argocd app delete`, Grafana `DELETE` calls, or push to any
 > datasource. If a task seems to need a destructive action, stop and ask.
+>
+> **Deploying or updating an app is GitOps.** `argocd` here is read-only — it
+> refuses sync, refresh, rollback and edits — and changes go through a pull
+> request to the deployment repo that a human merges. Never commit to `main`.
+> See [AGENTS.md](AGENTS.md#deploying-or-updating-an-app).
 
 The platform CLIs in one container, already wired up to authenticate. Developers
-don't install `argocd`, `bao`, or anything else locally — and they don't need
-`kubectl` or cluster access.
+don't install `argocd`, `bao`, `helm`, or anything else locally — and they don't
+need `kubectl` or cluster access.
 
 ```bash
 git clone https://github.com/GlueOps/toolbox && cd toolbox
@@ -74,6 +79,13 @@ against a small public endpoint — not your cluster, which may be slow or priva
 networking; a TLS failure there means an interception CA the host doesn't have,
 and it says so. It prints each decision.
 
+`up` also mounts the directory it was run from — or `TOOLBOX_WORKDIR` —
+read-only at the same path inside the container, and every `./toolbox <command>`
+starts in your current directory. So a deployment-configurations clone under it
+can be rendered with `./toolbox helm template …` using relative paths. Running
+`up` from somewhere outside the mounted directory recreates the container with
+the new mount; the login is kept.
+
 It also notices when it's being driven by an agent (Claude Code sets
 `CLAUDECODE`; otherwise, no terminal): then `up` prints the next step after the
 URL and `wait` returns after ~90s so it fits under a tool's command timeout. At a
@@ -89,6 +101,7 @@ terminal, `up` opens the browser and `wait` blocks until you've approved.
 | `./toolbox down` | remove the container; the login volume is kept |
 
 Overrides: `TOOLBOX_IMAGE`, `TOOLBOX_CONTAINER`, `TOOLBOX_VOLUME`,
+`TOOLBOX_WORKDIR` (default: the current directory),
 `TOOLBOX_PROBE_URL` (default `https://www.google.com/generate_204`), plus every
 container variable below is passed through if set.
 
@@ -96,7 +109,9 @@ container variable below is passed through if set.
 
 | | |
 |---|---|
-| `argocd …` | ArgoCD CLI. Authenticated per-invocation, so a long shell never goes stale. |
+| `argocd …` | ArgoCD CLI, **read-only**. Authenticated per-invocation, so a long shell never goes stale. Anything that changes state — sync, rollback, edits, `--refresh`, `app wait` — is refused (exit 5) before it reaches the server. |
+| `helm …` | Helm 3, the version ArgoCD's server renders with. For `helm template` of the deployment repo before pushing a change. |
+| `dyff …` | Kubernetes-aware YAML diff: `dyff between old.yaml new.yaml`. |
 | `bao …` | OpenBao CLI, pointed at a local proxy that attaches your token. |
 | `toolbox-login` | Authenticate. Runs automatically on an interactive start. |
 | `toolbox-login --begin` / `--wait` | The same login in two halves: print the URL and return (idempotent), then wait for approval — about 90 s per call, exit 2 means call again. For callers that can't sit on a blocking command. |
@@ -208,6 +223,22 @@ rather than letting them fail as a confusing 302, and passes an explicit
 `Key: Value`; `search` takes a bare host plus `--path-prefix` while `trace-id`
 takes a full URL; and `--use-grpc` is refused, because headers would then travel
 as gRPC metadata and never reach the edge.
+
+## GitOps: read-only ArgoCD, changes by pull request
+
+The cluster changes only when ArgoCD's automatic sync picks up a commit merged to
+the deployment repo. The `argocd` wrapper therefore allows only read commands,
+and the agent instructions require every change to be a pull request for a human
+to review. Both are conventions the toolbox enforces for itself; two platform
+settings make them hold for everyone:
+
+- **Branch protection on the deployment repo's `main`** — require pull requests
+  and block direct pushes (with an exception for the deploy bot, if it commits
+  directly). This is the only control that stops a push to `main` from a host.
+- **Optional: read-only ArgoCD RBAC** for the toolbox's group — drop `sync` and
+  `exec`. The wrapper's guard is a guardrail, not a boundary: the token is still
+  reachable inside the container. Note that RBAC cannot stop a refresh, since any
+  `get` permission can ask for one.
 
 ## Known risks
 
