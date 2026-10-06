@@ -19,6 +19,8 @@ git clone https://github.com/GlueOps/toolbox && cd toolbox
 ./toolbox shell                        # once approved
 ```
 
+> On Windows, run all of this inside WSL2 — see [Windows](#windows).
+
 Or without the wrapper:
 
 ```bash
@@ -394,27 +396,69 @@ server-side and keeps it off the command line.
 Built for `linux/amd64` and `linux/arm64`, so Apple Silicon is native — no
 emulation, no Rosetta.
 
-The host side, `./toolbox`, needs bash, the docker CLI and a docker daemon on
-the same machine: `up` bind-mounts your working directory and CA bundle, so a
-remote `DOCKER_HOST` or SSH docker context can't work. `propose` also needs
-`git` and `gh`. `tests/host-smoke.sh` checks a machine in a few minutes, with
-no login and throwaway names: `bash tests/host-smoke.sh`.
+The host side, `./toolbox`, needs bash, the docker CLI and a docker daemon that
+sees this machine's files at the same paths: `up` bind-mounts your working
+directory and the host's CA bundle. A local daemon is fine, even behind
+`DOCKER_HOST` or a docker context (rootless Docker, Colima, OrbStack, Docker
+Desktop); a daemon on another machine can't work. In a codespace or
+devcontainer that uses the host's docker, the workspace must be at the same path
+on the docker host (otherwise `up` fails with `bind source path does not
+exist`), and the CA bundle mounted is the docker host's, not the devcontainer's:
+for a CA added only inside the devcontainer, point `TOOLBOX_EXTRA_CA` at a file
+the docker host can see. `propose` also needs `git` and `gh`.
+
+To check a machine - about 15 seconds, no login, throwaway names, needs
+internet: `TOOLBOX_IMAGE=ghcr.io/glueops/toolbox:latest bash tests/host-smoke.sh`
+(without `TOOLBOX_IMAGE` it builds the image from your checkout first).
 
 | Host | Status |
 |---|---|
-| Linux, Docker Engine | Tested; the smoke test runs in CI |
-| A codespace or devcontainer using the host's docker | Tested — works when the workspace is at the same path on the docker host |
-| Windows: WSL2 (Ubuntu 24.04) with Docker Engine inside it | Tested: the smoke test, from the Linux filesystem and from `/mnt/c`, and a real login |
-| macOS: Docker Desktop, Colima, OrbStack | Expected to work (bash 3.2, BSD tools); not yet tested |
-| Linux, rootless Docker | Expected to work; not yet tested |
-| Windows: WSL2 with Docker Desktop | Expected to work; not yet tested |
+| Linux, Docker Engine | Tested: the smoke test on every pull request from a branch in this repo (GitHub's `ubuntu-latest`), and in a codespace |
+| A codespace or devcontainer using the host's docker | Tested in one codespace; needs the workspace at the same path on the docker host (see above) |
+| Windows Server 2025: WSL2 (Ubuntu 24.04) with Docker Engine inside it, as a normal user in the `docker` group, clone in WSL's filesystem (`~`) | Tested once: the smoke test and a real login |
+| Windows 10/11: the same setup | Expected to work (same WSL and Docker Engine); not yet tested |
+| Windows: clone on the Windows drive (`/mnt/c/...`) | Not recommended: in our test, `git clone` onto `/mnt/c` failed for a normal user (`chmod ... Operation not permitted`) and the smoke test passed there only as root. Keep clones in WSL's filesystem |
+| Windows: WSL2 with Docker Desktop | Expected to work; not yet tested (Docker Desktop needs a paid plan in larger companies; Docker Engine inside WSL doesn't) |
+| macOS: Docker Desktop, OrbStack, Colima | Expected to work (bash 3.2, BSD tools); not yet tested. Colima shares only your home directory by default, so keep clones under `~` |
+| Linux, rootless Docker | Expected to work; not yet tested. `up` can't start a rootless daemon for you |
 | Podman through its `docker` alias | Unknown |
-| Windows: Git Bash, PowerShell, cmd | Not supported — use WSL2 |
-| Remote docker daemons | Not supported |
+| Windows: Git Bash, PowerShell, cmd - including AI agents running natively on Windows (Claude Code for Windows runs commands in Git Bash) | Not supported (`up` refuses): run the toolbox, and your agent, inside WSL2 |
+| A docker daemon on another machine (`ssh://`, or `tcp://` to another host) | Not supported |
 
-**On Windows, clone inside WSL**, or with `core.autocrlf=false`. This repo's
-`.gitattributes` keeps the scripts' line endings LF either way; a script with
-CRLF fails with `/usr/bin/env: 'bash\r': No such file or directory`.
+### Windows
+
+Everything runs inside WSL2: the toolbox, `git`, `gh`, and your AI agent.
+
+- **Docker.** Install Docker Engine inside the WSL distro - the tested setup:
+  Docker's install steps for Ubuntu, then `sudo usermod -aG docker $USER` and a
+  new WSL shell - or use Docker Desktop with WSL integration for your distro.
+  Docker Engine wants systemd in WSL (`[boot]` `systemd=true` in
+  `/etc/wsl.conf`, which current Ubuntu images set). If the daemon isn't
+  running, `up` says `cannot connect to the docker daemon`: run
+  `sudo systemctl start docker`.
+- **Clone inside WSL** (`cd ~ && git clone ...`) with WSL's `git` - this repo
+  *and* your deployment repo. Don't clone onto `C:` or use Windows git on the
+  same clone: `/mnt/c` is much slower, its permissions didn't work for a normal
+  user in our test, and Windows git with `core.autocrlf=true` checks files out
+  with CRLF line endings. This repo's `.gitattributes` keeps fresh checkouts
+  LF; a script with CRLF fails with `/usr/bin/env: 'bash\r': No such file or
+  directory`. A clone made before that has to be refreshed - `git pull` and
+  `git reset --hard` don't do it: `git rm -r -q --cached . && git reset --hard`,
+  or clone again.
+- **The login URL.** `up` tries to open a browser, which in WSL often does
+  nothing: copy the printed URL into any browser on Windows (it's a device
+  login, so any browser works). With `wslu` installed (`sudo apt install
+  wslu`), `up` opens it with `wslview`.
+- **`propose`** uses WSL's `git` and `gh`: run `gh auth login` inside WSL.
+- **Corporate proxy or TLS inspection.** WSL doesn't use Windows' certificate
+  store or, with the default networking, its proxy settings. Export the proxy
+  variables in WSL; export the company CA from Windows to a `.crt` file and run
+  `TOOLBOX_EXTRA_CA=/path/to/ca.crt ./toolbox up <domain>`.
+- **Paths** are WSL paths (`/home/...`), never `C:\...` - including
+  `TOOLBOX_WORKDIR`.
+- **AI agents.** Run Claude Code, Codex or Cursor inside WSL, e.g. VS Code
+  connected to WSL. Claude Code installed natively on Windows runs commands in
+  Git Bash, which isn't supported.
 
 ## Releases
 

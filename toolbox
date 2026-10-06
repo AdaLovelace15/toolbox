@@ -168,7 +168,11 @@ run_container() {  # $1 = bridge|host
     fi
     if [ -n "${TOOLBOX_EXTRA_CA:-}" ]; then
         [ -r "$TOOLBOX_EXTRA_CA" ] || die "TOOLBOX_EXTRA_CA=$TOOLBOX_EXTRA_CA is not readable"
-        args+=(-v "$TOOLBOX_EXTRA_CA:/toolbox-extra-ca.crt:ro"); cas="${cas:+$cas:}/toolbox-extra-ca.crt"
+        # Named explicitly, so it must arrive: --mount fails loudly where -v would
+        # silently mount an empty directory (a daemon that can't see the file).
+        # The host bundle above stays lenient - it's a best-effort extra.
+        case "$TOOLBOX_EXTRA_CA" in *,*|*\"*) die "TOOLBOX_EXTRA_CA path can't contain a comma or quote" ;; esac
+        args+=(--mount "type=bind,src=$TOOLBOX_EXTRA_CA,dst=/toolbox-extra-ca.crt,readonly"); cas="${cas:+$cas:}/toolbox-extra-ca.crt"
         log "trusting extra CA: $TOOLBOX_EXTRA_CA"
     fi
     [ -n "$cas" ] && args+=(-e "TOOLBOX_EXTRA_CA=$cas")
@@ -207,7 +211,10 @@ begin() {
 
 open_browser() {
     local url=$1
-    if command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 &
+    # WSL: wslview (from wslu) opens the Windows browser; xdg-open there often can't.
+    if grep -qi microsoft /proc/version 2>/dev/null && command -v wslview >/dev/null 2>&1; then
+        wslview "$url" >/dev/null 2>&1 &
+    elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 &
     elif command -v open >/dev/null 2>&1; then open "$url" >/dev/null 2>&1 &
     fi
 }
@@ -279,10 +286,12 @@ check_gate() {
 # trailing dot, capitals) and must not read as a different cluster.
 normalise_domain() {
     local d=$1
-    d=$(printf '%s' "$d" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    # Surrounding whitespace goes; whitespace inside means it isn't a domain.
+    d=$(printf '%s' "$d" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
     d=${d#*://}; d=${d%%/*}
     while [ "${d%.}" != "$d" ]; do d=${d%.}; done
     case "$d" in ""|.*|*..*|-*|*[!a-z0-9.-]*) return 1 ;; esac
+    case "$d" in *.*) ;; *) return 1 ;; esac   # a captain domain has several labels
     printf '%s' "$d"
 }
 
@@ -454,7 +463,8 @@ cmd_up() {
         run_container host
         if login; then return 0; fi
     fi
-    die "cannot reach https://dex.$DOMAIN from inside the container. Check the captain domain, and that this host can reach it: curl https://dex.$DOMAIN/healthz"
+    local dex="${TOOLBOX_DEX_URL:-https://dex.$DOMAIN}"
+    die "cannot reach $dex from inside the container. Check the captain domain, and that this host can reach it: curl $dex/healthz"
 }
 
 cmd_wait() {
@@ -739,6 +749,13 @@ cmd_status() {
     fi
 }
 
+# Native Windows shells can't drive it (paths, mounts, line endings): WSL2 only.
+case "${1:-}" in -h|--help|help|""|rules) ;; *)
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) die "Windows shells (Git Bash, MSYS, Cygwin) aren't supported: run the toolbox - and your AI agent - inside WSL2. See HUMANS.md#windows" ;;
+    esac ;;
+esac
+
 case "${1:-}" in
     up)      shift; cmd_up "$@" ;;
     wait)    cmd_wait ;;
@@ -748,8 +765,12 @@ case "${1:-}" in
     rules)   cmd_rules ;;
     reauth)  shift; cmd_reauth "$@" ;;
     down)    v=$(container_volume); v=${v:-$VOLUME}
-             docker rm -f "$NAME" >/dev/null 2>&1 \
-                 && log "removed $NAME (login volume $v kept for $(volume_label "$v" "$CLUSTER_LABEL"); up for another cluster removes it)" ;;
+             if ! docker container inspect "$NAME" >/dev/null 2>&1; then
+                 log "no container $NAME to remove"
+             else
+                 docker rm -f "$NAME" >/dev/null \
+                     && log "removed $NAME (login volume $v kept for $(volume_label "$v" "$CLUSTER_LABEL"); up for another cluster removes it)"
+             fi ;;
     -h|--help|help|"") usage 0 ;;
     *)       cmd_exec "$@" ;;
 esac
