@@ -279,9 +279,10 @@ check_gate() {
 # trailing dot, capitals) and must not read as a different cluster.
 normalise_domain() {
     local d=$1
-    d=${d#*://}; d=${d%%/*}; d=${d%.}
-    d=$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')
-    case "$d" in ""|.*|*..*|*[!a-z0-9.-]*) return 1 ;; esac
+    d=$(printf '%s' "$d" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    d=${d#*://}; d=${d%%/*}
+    while [ "${d%.}" != "$d" ]; do d=${d%.}; done
+    case "$d" in ""|.*|*..*|-*|*[!a-z0-9.-]*) return 1 ;; esac
     printf '%s' "$d"
 }
 
@@ -289,40 +290,66 @@ volume_exists() { docker volume inspect "$1" >/dev/null 2>&1; }
 volume_label() {  # volume, label
     docker volume inspect -f "{{index .Labels \"$2\"}}" "$1" 2>/dev/null | sed 's/^<no value>$//' || true
 }
+# TOOLBOX_VOLUME may name a host directory (a bind mount): never created or removed here.
+is_host_path() { case "$1" in */*) return 0 ;; esac; return 1; }
 # A volume `up` created, or the unlabelled default every earlier version used.
-volume_is_ours() { [ "$(volume_label "$1" "$LOGIN_LABEL")" = 1 ] || [ "$1" = glueops-toolbox ]; }
+volume_is_ours() {
+    ! is_host_path "$1" && { [ "$(volume_label "$1" "$LOGIN_LABEL")" = 1 ] || [ "$1" = glueops-toolbox ]; }
+}
 # The login volume the container actually mounts - it may predate TOOLBOX_VOLUME.
 container_volume() {
     docker container inspect -f '{{range .Mounts}}{{if eq .Destination "/home/toolbox/.config/glueops"}}{{.Name}}{{end}}{{end}}' "$NAME" 2>/dev/null || true
 }
 ensure_volume() {
+    is_host_path "$VOLUME" && return 0
     volume_exists "$VOLUME" \
         || docker volume create --label "$LOGIN_LABEL=1" --label "$CLUSTER_LABEL=$DOMAIN" "$VOLUME" >/dev/null
 }
+# Why a login volume can't be removed, or nothing if it can.
+volume_blocker() {
+    local v=$1 others
+    if is_host_path "$v"; then echo "it is a host directory"; return; fi
+    if ! volume_is_ours "$v"; then echo "the toolbox didn't create it"; return; fi
+    others=$(docker ps -a --filter "volume=$v" --format '{{.Names}}' 2>/dev/null | grep -vxF "$NAME" | paste -sd, - || true)
+    if [ -n "$others" ]; then echo "it is also used by: $others"; fi
+}
 
 # Remove the container and its login volume(s): every cached token and
-# half-finished login. Never a volume the toolbox didn't create.
-forget_everything() {
-    local vols=() v removed=""
+# half-finished login. Checks everything before removing anything. A volume the
+# toolbox didn't create, or a host directory, is never removed: reauth refuses,
+# a cluster switch leaves it with a warning (inside the container, a login for
+# another cluster is discarded rather than used). A volume another container
+# still uses stops both, before anything is removed.
+forget_everything() {  # reauth|switch
+    local mode=$1 vols=() keep=() v why removed=""
     v=$(container_volume)
     if [ -n "$v" ]; then vols+=("$v"); fi
     if [ "$v" != "$VOLUME" ]; then vols+=("$VOLUME"); fi
     for v in "${vols[@]}"; do
-        if volume_exists "$v" && ! volume_is_ours "$v"; then
-            die "refusing to remove volume $v: it isn't a toolbox login volume. Point TOOLBOX_VOLUME at the toolbox's own, or remove it yourself"
-        fi
+        is_host_path "$v" || volume_exists "$v" || continue
+        why=$(volume_blocker "$v")
+        [ -n "$why" ] || continue
+        case "$why" in
+            "it is also used by"*)
+                die "nothing was removed: the login volume $v is in use - $why. Remove those containers (docker rm -f <name>), then run this again" ;;
+        esac
+        [ "$mode" = switch ] || die "nothing was removed: refusing to remove $v - $why. Point TOOLBOX_VOLUME at the toolbox's own login volume, or remove it yourself"
+        keep+=("$v")
     done
     if docker container inspect "$NAME" >/dev/null 2>&1; then
         docker rm -f "$NAME" >/dev/null
         removed="container $NAME"
     fi
     for v in "${vols[@]}"; do
-        volume_exists "$v" || continue
-        docker volume rm "$v" >/dev/null \
-            || die "could not remove the login volume $v - is another container using it? (docker ps -a --filter volume=$v) Free it, then run this again"
+        if is_host_path "$v" || ! volume_exists "$v"; then continue; fi
+        if [ "${#keep[@]}" -gt 0 ] && printf '%s\n' "${keep[@]}" | grep -qxF "$v"; then continue; fi
+        docker volume rm "$v" >/dev/null || die "removed ${removed:-nothing}, but not the login volume $v; remove it yourself (docker volume rm $v)"
         removed="${removed:+$removed, }volume $v"
     done
     log "removed: ${removed:-nothing - there was no container or login volume}"
+    if [ "${#keep[@]}" -gt 0 ]; then
+        log "left ${keep[*]} in place (not created by the toolbox); a login in it for another cluster is discarded on first use"
+    fi
 }
 
 cmd_up() {
@@ -342,28 +369,35 @@ cmd_up() {
     # One cluster at a time. The container (running or not) and the login volume
     # each record their cluster; a login for any other is removed before anything
     # starts - including after `down`, when only the volume is left.
-    local had vol_had
-    had=$(normalise_domain "$(container_domain)" || true)
+    local raw_had had vol_had why
+    raw_had=$(container_domain)
+    had=$(normalise_domain "$raw_had" || true)
     vol_had=$(volume_label "$VOLUME" "$CLUSTER_LABEL")
-    if [ -n "$had" ] && [ "$had" != "$DOMAIN" ]; then
-        log "switching cluster: $had -> $DOMAIN; removing the old container and its login"
-        forget_everything
+    if [ -n "$raw_had" ] && [ "$had" != "$DOMAIN" ]; then
+        log "switching cluster: ${had:-$raw_had} -> $DOMAIN; removing the old container and its login"
+        forget_everything switch
     elif volume_exists "$VOLUME" && [ "$vol_had" != "$DOMAIN" ]; then
         if [ -n "$vol_had" ]; then
             log "switching cluster: $vol_had -> $DOMAIN; removing the old login"
-            forget_everything
-        elif volume_is_ours "$VOLUME"; then
-            log "the login volume $VOLUME predates cluster tracking; removing it (a one-time sign-in after this upgrade)"
-            forget_everything
+            forget_everything switch
         else
-            log "volume $VOLUME records no cluster and isn't one the toolbox created; leaving it (a login in it for another cluster is discarded on first use)"
+            why=$(volume_blocker "$VOLUME")
+            if [ -z "$why" ]; then
+                log "the login volume $VOLUME predates cluster tracking; removing it - sign in once more (pull the new image too, docker pull $IMAGE, or that costs another sign-in later)"
+                forget_everything switch
+            elif [ -z "$raw_had" ] || [ "$(container_volume)" != "$VOLUME" ]; then
+                # Only said when a container is about to be (re)created on it.
+                log "leaving the login volume $VOLUME ($why); a login in it for another cluster is discarded on first use"
+            fi
         fi
     fi
 
     if [ "$(docker container inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = true ]; then
         local mounted
         mounted=$(container_workdir)
-        if [ "$(container_env TOOLBOX_DEX_URL)" != "${TOOLBOX_DEX_URL:-}" ] \
+        if ! is_host_path "$VOLUME" && [ "$(container_volume)" != "$VOLUME" ]; then
+            log "running container uses login volume $(container_volume), not $VOLUME; recreating it on $VOLUME (sign in once more)"
+        elif [ "$(container_env TOOLBOX_DEX_URL)" != "${TOOLBOX_DEX_URL:-}" ] \
            || [ "$(container_env TOOLBOX_CLIENT_ID)" != "${TOOLBOX_CLIENT_ID:-}" ]; then
             # Same domain, another Dex or client: env is fixed at creation.
             log "running container has a different TOOLBOX_DEX_URL or TOOLBOX_CLIENT_ID; recreating it"
@@ -667,21 +701,32 @@ cmd_reauth() {
     # Keep the mount the old container had, unless told otherwise.
     if [ -z "${TOOLBOX_WORKDIR:-}" ]; then
         w=$(container_workdir)
-        if [ -n "$w" ]; then TOOLBOX_WORKDIR=$w; fi
+        if [ -n "$w" ] && [ -d "$w" ]; then
+            TOOLBOX_WORKDIR=$w
+            log "keeping workdir $w"
+        fi
     fi
     resolve_workdir
     log "re-authenticating to $domain: removing container $NAME and its login volume (cached Dex, refresh and OpenBao tokens)"
-    log "to sign in as someone else, open the new URL in a private window, or sign out of GitHub first"
-    forget_everything
+    forget_everything reauth
     cmd_up "$domain"
+    log "to sign in as someone else, open that URL in a private window, or sign out of GitHub first"
 }
 
 cmd_status() {
     local st
-    st=$(docker container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo "absent")
+    st=$(docker container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null) || st=absent
     printf 'container: %s' "$st"
     [ "$st" = running ] && printf ' (%s)' "$(container_domain)"
     printf '\n'
+    local v c
+    v=$(container_volume); v=${v:-$VOLUME}
+    if volume_exists "$v"; then
+        c=$(volume_label "$v" "$CLUSTER_LABEL")
+        echo "login volume: $v (${c:-no cluster recorded})"
+    else
+        echo "login volume: none"
+    fi
     if [ "$st" = running ]; then
         if docker exec "$NAME" toolbox-token --no-login >/dev/null 2>&1; then
             echo "login: authenticated"
@@ -689,7 +734,6 @@ cmd_status() {
             echo "login: not authenticated - run 'toolbox up <domain>' for a URL"
         fi
         echo "observability: $(obs_mode "$(container_env TOOLBOX_ENABLE_OBSERVABILITY)")"
-        echo "login volume: $(container_volume) ($(volume_label "$(container_volume)" "$CLUSTER_LABEL"))"
         check_gate
         log "BETA - argocd and bao only; see HUMANS.md#beta-and-risk-acceptance (agents: ./toolbox rules)"
     fi
@@ -703,7 +747,9 @@ case "${1:-}" in
     propose) shift; cmd_propose "$@" ;;
     rules)   cmd_rules ;;
     reauth)  shift; cmd_reauth "$@" ;;
-    down)    docker rm -f "$NAME" >/dev/null 2>&1 && log "removed $NAME (volume $VOLUME kept)" ;;
+    down)    v=$(container_volume); v=${v:-$VOLUME}
+             docker rm -f "$NAME" >/dev/null 2>&1 \
+                 && log "removed $NAME (login volume $v kept for $(volume_label "$v" "$CLUSTER_LABEL"); up for another cluster removes it)" ;;
     -h|--help|help|"") usage 0 ;;
     *)       cmd_exec "$@" ;;
 esac

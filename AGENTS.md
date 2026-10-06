@@ -80,8 +80,11 @@ there is nothing to approve; go straight to step 2.
 cluster? `./toolbox reauth [<captain-domain>]` removes the container and its login
 volume — every cached token and half-finished login — and runs `up` from scratch:
 show the new URL, then `./toolbox wait`. To sign in as someone else, the human
-opens the URL in a private window or signs out of GitHub first. The toolbox serves
-one cluster at a time; `up` for a different domain does the same removal by itself.
+opens the URL in a private window or signs out of GitHub first. If the human only suspects the login is broken, run `./toolbox status` first:
+`not authenticated` means `./toolbox up <domain>` (no wipe needed); `authenticated`
+means the failure is something else — report it, and offer `reauth`.
+The toolbox serves one cluster at a time; `up` for a different domain does the
+same removal by itself.
 
 `wait` returns after about 90 seconds if the human hasn't approved yet, so it
 fits under your tool's command timeout: exit code 2 and `still waiting` mean run

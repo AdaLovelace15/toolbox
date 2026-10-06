@@ -84,7 +84,7 @@ class ClusterScopedLogin(unittest.TestCase):
         ta._write_private_json(ta.cache_path(), {"id_token": jwt(time.time() + 3600)})
         cache, err = self.quiet(ta._read_cache)
         self.assertEqual(cache, {})
-        self.assertIn("older toolbox", err)
+        self.assertIn("older version", err)
 
     def test_pending_code_from_another_cluster_is_dropped(self):
         ta._write_private_json(ta.pending_path(), {"device_code": "d", "cluster": ta.cluster_id(),
@@ -94,11 +94,13 @@ class ClusterScopedLogin(unittest.TestCase):
         self.assertIsNone(ta._read_pending())
         self.assertFalse(os.path.exists(ta.pending_path()))
 
-    def test_dex_override_or_client_counts_as_another_cluster(self):
+    def test_another_client_counts_as_another_cluster(self):
         ta._write_cache({"id_token": jwt(time.time() + 3600)})
         os.environ["TOOLBOX_CLIENT_ID"] = "other"
-        cache, _ = self.quiet(ta._read_cache)
+        cache, err = self.quiet(ta._read_cache)
         self.assertEqual(cache, {})
+        self.assertIn("was for client toolbox, not other", err)
+        self.assertFalse(os.path.exists(ta.cache_path()))
 
     def test_dex_url_override_counts_as_another_cluster(self):
         ta._write_cache({"id_token": jwt(time.time() + 3600)})
@@ -133,6 +135,43 @@ class ClusterScopedLogin(unittest.TestCase):
         ta.forget_bao()
         self.assertFalse(os.path.exists(ta.bao_token_path()))
         ta.forget_bao()   # and is quiet when there is none
+
+    def test_a_refreshed_login_keeps_its_cluster(self):
+        ta._write_cache({"id_token": jwt(time.time() - 10), "refresh_token": "r"})
+        fresh = jwt(time.time() + 3600)
+        orig = ta._post
+        ta._post = lambda *a, **k: (200, {"id_token": fresh})
+        try:
+            tok, _ = self.quiet(ta.get_token, False, False)
+        finally:
+            ta._post = orig
+        self.assertEqual(tok, fresh)
+        cache, err = self.quiet(ta._read_cache)
+        self.assertEqual(cache["id_token"], fresh)
+        self.assertEqual(cache["refresh_token"], "r")
+        self.assertEqual(err, "")
+
+    def test_a_login_written_while_a_stale_one_is_discarded_survives(self):
+        ta._write_private_json(ta.cache_path(), {"id_token": "x"})   # stale
+        real_stat, fresh = ta.os.stat, jwt(time.time() + 3600)
+        state = {"done": False}
+
+        def racing_stat(path, *a, **k):
+            # Another process writes a fresh login (twice, so a freed inode could
+            # be reused) just before the discard compares inodes.
+            if path == ta.cache_path() and not state["done"]:
+                state["done"] = True
+                ta._write_cache({"id_token": "interim"})
+                ta._write_cache({"id_token": fresh})
+            return real_stat(path, *a, **k)
+
+        ta.os.stat = racing_stat
+        try:
+            self.quiet(ta._read_cache)
+        finally:
+            ta.os.stat = real_stat
+        cache, _ = self.quiet(ta._read_cache)
+        self.assertEqual(cache.get("id_token"), fresh)
 
     def test_forced_logout_writes_an_empty_cache_silently(self):
         ta._write_cache({})

@@ -121,11 +121,23 @@ the login inside also records its Dex issuer and client. `up` for a different
 captain domain — even after `down`, with no container left — removes the
 container and that volume before starting, so no token from the old cluster
 survives. `https://`, a trailing `/` or `.`, and capitals don't count as a
-different domain. `./toolbox reauth` does the same removal on demand. Only
-volumes the toolbox created are ever removed; and inside the container, a cached
-login for another cluster is discarded rather than used, as a backstop. After
-upgrading to this version everyone signs in once more: logins cached before did
-not record their cluster.
+different domain. `./toolbox reauth` does the same removal on demand. The tokens
+are removed from this machine, not revoked; they expire on their own. Switching
+back costs another sign-in - to keep two clusters signed in, give each its own
+container: `TOOLBOX_CONTAINER=toolbox-prod ./toolbox up prod…`.
+
+Only volumes the toolbox created are ever removed. `TOOLBOX_VOLUME` may name your
+own volume or a host directory; those are never removed (a cluster switch leaves
+them with a warning, and `reauth` refuses), and inside the container a cached
+login for another cluster is discarded rather than used, as a backstop. A login
+volume another container still uses stops both, before anything is removed.
+
+**Upgrading to this version:** everyone signs in once more, because logins cached
+before didn't record their cluster - once, if the script and the image are
+upgraded together (`git pull` and `docker pull ghcr.io/glueops/toolbox:latest`).
+A container started with `TOOLBOX_CONTAINER` set now gets its own
+`glueops-<name>` volume instead of sharing `glueops-toolbox`; if an old container
+still uses the shared volume, remove it (`docker rm -f <name>`).
 
 `up` also mounts the directory it was run from — or `TOOLBOX_WORKDIR` —
 read-only at the same path inside the container, and every `./toolbox <command>`

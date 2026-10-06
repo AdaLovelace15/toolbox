@@ -24,4 +24,6 @@ if __name__ == "__main__":
             sys.exit(1)
         print(tok)
         sys.exit(0)
+    if "--login" in sys.argv:
+        toolbox_auth.forget_bao()   # the old identity's OpenBao token must not outlive it
     print(toolbox_auth.get_token(force_login="--login" in sys.argv))

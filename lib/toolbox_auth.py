@@ -145,35 +145,48 @@ def forget_bao():
         pass
 
 
+def _discard_if_unchanged(path, f):
+    """Delete `path` only if it is still the file `f` has open. Compared while it
+    is open, so its inode can't be freed and reused by a concurrent writer's new
+    file; a writer landing between the stat and the remove is the one window left
+    (microseconds, and only on the first read after a cluster change). True if
+    it is gone."""
+    try:
+        if os.stat(path).st_ino == os.fstat(f.fileno()).st_ino:
+            os.remove(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def _read_cache():
     try:
         with open(cache_path()) as f:
-            ino = os.fstat(f.fileno()).st_ino
             obj = json.load(f)
+            if not isinstance(obj, dict) or not obj:
+                return {}
+            had = obj.get("cluster")
+            if had == cluster_id():
+                return obj
+            # Not ours: never use it, and remove it - unless another process has
+            # replaced it with a fresh login since it was read.
+            gone = _discard_if_unchanged(cache_path(), f)
     except (OSError, ValueError):
         return {}
-    if not isinstance(obj, dict) or not obj:
-        return {}
-    had = obj.get("cluster")
-    if had == cluster_id():
-        return obj
-    # Not ours: never use it. Delete it only if it is still the file just read -
-    # the proxy, toolbox-token and --wait share this cache, and another of them
-    # may have written a fresh login since. A pending code has its own check.
-    try:
-        if os.stat(cache_path()).st_ino == ino:
-            os.remove(cache_path())
-    except OSError:
-        pass
     if not isinstance(had, dict):
-        log("toolbox: the cached login is from an older toolbox that didn't record its "
-            "cluster; discarded it once - approve the new URL to sign in")
+        why = "records no cluster this toolbox understands (it is from an older version)"
     elif had.get("dex") != dex_url():
-        log(f"toolbox: the cached login was for {had.get('dex')}, not {dex_url()}; "
-            "discarded it - approve the new URL to sign in")
+        why = f"was for {had.get('dex')}, not {dex_url()}"
+    elif had.get("client_id") != client_id():
+        why = f"was for client {had.get('client_id')}, not {client_id()}"
     else:
-        log(f"toolbox: the cached login was for client {had.get('client_id')}, not "
-            f"{client_id()}; discarded it - approve the new URL to sign in")
+        why = "was for a different cluster"
+    if gone:
+        log(f"toolbox: the cached login {why}; discarded it - sign in again")
+    else:
+        log(f"toolbox: the cached login {why}; ignoring it (could not remove {cache_path()})")
     return {}
 
 
@@ -304,12 +317,13 @@ def _read_pending():
     try:
         with open(pending_path()) as f:
             obj = json.load(f)
+            if isinstance(obj, dict) and obj.get("cluster") == cluster_id():
+                return obj
+            # A code from another cluster's Dex can never be approved here.
+            _discard_if_unchanged(pending_path(), f)
     except (OSError, ValueError):
-        return None
-    if not isinstance(obj, dict) or obj.get("cluster") != cluster_id():
-        _clear_pending()   # a code from another cluster's Dex can never be approved here
-        return None
-    return obj
+        pass
+    return None
 
 
 def _clear_pending():

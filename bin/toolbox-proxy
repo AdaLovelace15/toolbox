@@ -73,7 +73,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # OpenBao's own error shape, so `bao` prints the message plainly
             # instead of dumping an HTML error page into the terminal.
             self._json(511, {"errors": [
-                "toolbox: not authenticated - run 'toolbox-login', then retry"
+                "toolbox: not authenticated - run './toolbox up <domain>' on the host, then retry"
             ]})
             return
         req.add_header("Authorization", "Bearer " + token)
@@ -90,9 +90,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 loc = e.headers.get("Location", "")
                 if "/oauth2/start" in loc or "/oauth2/sign_in" in loc:
                     self._json(401, {"errors": [
-                        "toolbox: the platform edge rejected this token - ask the human, "
-                        "then run './toolbox reauth' on the host (an ArgoCD permission "
-                        "error can look like this too)"
+                        "toolbox: the platform edge sent this request to its login page - "
+                        "usually an OpenBao permission error (a 403 rewritten by the edge), "
+                        "not an expired login. Check the path and your role; if "
+                        "'./toolbox status' says 'not authenticated', run "
+                        "'./toolbox up <domain>'. Use './toolbox reauth' only if the human asks."
                     ]})
                 else:
                     self._json(502, {"errors": [
