@@ -62,6 +62,15 @@ jobs:
         run: |
           docker buildx build --load -t toolbox:ci .
           docker run --rm --entrypoint bao toolbox:ci version
-          docker run --rm --entrypoint argocd.real toolbox:ci version --client
+          docker run --rm --entrypoint /usr/local/libexec/toolbox/argocd.real toolbox:ci version --client
+          docker run --rm --entrypoint helm toolbox:ci version --short
+          docker run --rm --entrypoint dyff toolbox:ci version
           docker run --rm --entrypoint python3 toolbox:ci \
-            -c "import sys; sys.path.insert(0,'/opt/toolbox/lib'); import toolbox_auth; print('lib ok')"
+            -c "import sys, yaml; sys.path.insert(0,'/opt/toolbox/lib'); import toolbox_auth; print('lib ok')"
+
+      # The argocd wrapper must refuse anything that is not read-only, before it
+      # ever fetches a token. Runs with no server and no login.
+      - name: ArgoCD read-only guard
+        if: github.event_name == 'pull_request'
+        run: |
+          docker run --rm -v "$PWD/tests:/tests:ro" --entrypoint bash toolbox:ci /tests/argocd-guard.sh

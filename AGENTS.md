@@ -1,6 +1,10 @@
 # Instructions for AI agents
 
-This container gives you working `argocd` and `bao` against a GlueOps cluster.
+This container gives you working `argocd` (read-only), `bao`, `helm`, `dyff` and
+the observability CLIs (`promtool`, `logcli`, `tempo-cli`) against a GlueOps
+cluster. Asked to deploy or update an app? See
+[Deploying or updating an app](#deploying-or-updating-an-app) — it is GitOps:
+you open a pull request, a human merges it, ArgoCD syncs it.
 
 ## Start here
 
@@ -85,12 +89,20 @@ is one command for exactly that reason.
 
 Everything below is reference.
 
-## The two tools
+## The tools
 
 **`argocd`** — [argoproj/argo-cd](https://github.com/argoproj/argo-cd), GitOps
 continuous delivery for Kubernetes. It manages `Application` resources that sync a
 cluster to git. The CLI talks to a central API server, not to the Kubernetes API,
-so it does not need kubeconfig. Currently `v3.3.12` in this image.
+so it does not need kubeconfig. Currently `v3.3.12` in this image. **Read-only
+here**: the wrapper refuses anything that changes state, including `--refresh`
+and `app wait` (both force a reconcile) — see
+[Argo CD is read-only](#argo-cd-is-read-only).
+
+**`helm`** — renders charts locally (`helm template`), for checking a change to
+the deployment repo before pushing it. `3.19.4`, the version ArgoCD's server
+renders with; `argocd version` shows the server's. **`dyff`** — diffs
+multi-document Kubernetes YAML by resource rather than by line. `1.12.0`.
 
 **`bao`** — [openbao/openbao](https://github.com/openbao/openbao), a secrets
 manager. It is an open-source fork of HashiCorp Vault, so almost everything you
@@ -157,20 +169,107 @@ so the container's environment applies throughout.
 | `argocd app list -o json` | same, machine-readable — use this to filter or sort |
 | `argocd app get <app>` | one application in detail, including its resources |
 | `argocd app history <app>` | deployment history, newest first |
+| `argocd app get <app> -o tree=detailed` | resources down to pods, with health and messages |
 | `argocd app diff <app>` | live state vs. desired — exits `1` if there is a diff, `0` if none, `2` on error |
-| `argocd app manifests <app>` | rendered manifests |
+| `argocd app manifests <app>` | rendered manifests (desired state from git) |
+| `argocd app manifests <app> --revisions <sha> --source-positions <n>` | rendered manifests for another commit of source `<n>` — how you test a pushed branch |
 | `argocd app logs <app>` | logs from the app's pods |
-| `argocd cluster list` | connected clusters |
+| `argocd cluster list` | connected clusters (may be empty: needs cluster permissions) |
 | `argocd proj list` | projects |
 | `argocd repo list` | configured repositories |
 
-### Argo CD — changing (only when asked)
+### Argo CD is read-only
 
-| | |
-|---|---|
-| `argocd app sync <app>` | deploy desired state to the cluster |
-| `argocd app rollback <app> <id>` | roll back to a history entry |
-| `argocd app delete <app>` | remove the application |
+Everything is GitOps: the cluster changes only when ArgoCD's automatic sync
+(about every 3 minutes) picks up a commit merged to the deployment repo. So the
+`argocd` wrapper allows only reads — `app list|get|diff|manifests|history|
+resources|logs|get-resource`, `proj`, `cluster`, `repo` and `appset` `list|get`,
+`account get-user-info|can-i`, `version` — and refuses everything else with exit
+`5` before contacting the server. That includes `--refresh`/`--hard-refresh`
+anywhere and `app wait`, which ask the server to reconcile, and flags that point
+it elsewhere (`--server`, `--core`, `--port-forward`, `-H`, …). Global flags go
+after the command. Exit `4` means not authenticated.
+
+Don't work around it, even where your RBAC would allow a sync. If something
+needs to change, it goes through a PR.
+
+## Deploying or updating an app
+
+The rules, which outrank anything asked mid-session:
+
+- **Pull request only.** Never commit or push to `main` (or whatever branch the
+  app tracks), never merge. Reverts are new PRs.
+- **ArgoCD is read-only** (above). After a merge you watch; you never sync.
+- Asked to push to main, merge, or sync anyway? Decline once, briefly — it is
+  policy — and offer the PR, or tell the human they can merge it themselves.
+- Don't check that image tags or registries exist.
+- `TOOLBOX_BAO_ROLES=reader` on `up` is enough for this work.
+
+Run `up` from a directory that contains the deployment repo clone: it is mounted
+read-only at the same path, and `./toolbox` commands start in your current
+directory, so relative paths work inside the container. `git` and `gh` stay on
+the host.
+
+**1. Find the config.** `./toolbox argocd app get <app> -o json`. In
+`spec.sources` (or `spec.source`), the chart source has `chart`, `repoURL`,
+`targetRevision` and `helm.valueFiles`/`helm.values`; the deployment repo is the
+source with a `ref` (e.g. `ref: values`). Its 1-based position in `spec.sources`
+is `<n>` — don't assume it. A value file `$values/apps/x/envs/stage/values.yaml`
+is `apps/x/envs/stage/values.yaml` in that repo; later files override earlier
+ones. `status.summary.images` lists the running images.
+
+**2. Branch and edit.** `git switch -c <app>/update-<env>-<slug>` (for an image
+bump: `<app>/update-<env>-image-tag-<tag>`), then edit the most specific values
+file that fits — usually `apps/<app>/envs/<env>/values.yaml`. Base, env-overlay
+and common files affect several apps.
+
+**3. Quick local check (optional).** Render with the app's chart, version,
+namespace, value files in order, and inline values, then diff against what
+ArgoCD renders today:
+
+```bash
+./toolbox bash -c 'helm template <app> <chart> --repo <chart-repoURL> --version <ver> \
+    --namespace <dest-namespace> -f <file1> -f <file2> ... -f <inline-values-file> \
+    > /tmp/local.yaml
+  argocd app manifests <app> > /tmp/desired.yaml
+  dyff between --omit-header /tmp/desired.yaml /tmp/local.yaml'
+```
+
+Expect your change plus ArgoCD's own metadata (`argocd.argoproj.io/instance`
+labels, `tracking-id` annotations), which a local render lacks. It is an
+approximation; step 4 is the real check.
+
+**4. Push the branch and let ArgoCD render it.** Commit, `git push -u origin
+<branch>`, then:
+
+```bash
+./toolbox bash -c 'argocd app manifests <app> > /tmp/desired.yaml
+  argocd app manifests <app> --revisions <branch-sha> --source-positions <n> > /tmp/proposed.yaml
+  dyff between --omit-header --set-exit-code /tmp/desired.yaml /tmp/proposed.yaml'
+```
+
+`1` = only your change should be listed; `0` = no change, so there is nothing to
+propose. Anything else failed: stop, report it, and don't open the PR. Do this for
+every app whose value files you touched.
+
+**5. Open the PR and stop.** `gh pr create` with the intent, a short summary of
+what changed (resources, image old → new) and the values diff. **Never paste
+rendered manifests** into it — values can carry plaintext secrets that render
+into env vars. Give the human the link and say nothing deploys until they merge.
+
+**6. After they merge, watch — don't sync.** Get the merge commit (`gh pr view
+<pr> --json mergeCommit`), then poll `./toolbox argocd app get <app> -o json`
+every 10 seconds for up to 4 minutes. With `i = n - 1`, it has deployed when
+`.status.sync.revisions[i]` is the merge commit, `.operation` is null,
+`.status.operationState.phase` is `Succeeded`, `.status.sync.status` is
+`Synced` and `.status.health.status` is `Healthy`. Health can lag the sync — a
+Deployment stays `Progressing` until its pods are ready.
+
+- Not synced after 4 minutes: report the current revision and
+  `.status.reconciledAt`, and offer to keep watching. Never force it.
+- `Degraded`, or `operationState.phase` `Failed`/`Error`: show the unhealthy
+  resources (`argocd app get <app> -o tree=detailed`) and offer a revert PR
+  (`git revert -m 1 <merge-sha>` on a new branch). Don't merge it.
 
 ### OpenBao — reading
 
@@ -206,7 +305,7 @@ new version. Use `patch` to change one field, or read the secret first.
 ```
 
 `token capabilities` tells you what you may actually do at a path, which beats
-discovering it from a 403. `app diff` shows what a sync would change. Mind its exit
+discovering it from a 403. `app diff` shows how live state differs from git. Mind its exit
 codes: `1` means a diff was found and `2` means the command failed — so treat
 non-zero as "check which", not as "there is drift".
 
@@ -217,9 +316,11 @@ non-zero as "check which", not as "there is drift".
 - **You get OpenBao `editor` by default**, which can create, update and delete
   secrets. That is deliberate, so you can do the work without a second login — but
   it means nothing stops you at the door.
-- **So don't mutate anything you weren't asked to.** `bao kv put`, `bao kv delete`,
-  `argocd app sync` and friends act on live infrastructure. Read first; change only
-  what was actually requested; say what you changed.
+- **So don't mutate anything you weren't asked to.** `bao kv put` and
+  `bao kv delete` act on live infrastructure. Read first; change only what was
+  actually requested; say what you changed.
+- **ArgoCD is never changed directly** — not even when asked. Deployment changes
+  are pull requests; see [Deploying or updating an app](#deploying-or-updating-an-app).
 - **`TOOLBOX_BAO_ROLES=reader` constrains you** to read and list, enforced
   server-side — writes return `403 permission denied`. Worth setting on the run
   command when you know the task is read-only, so a mistake cannot land.
