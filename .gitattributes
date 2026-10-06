@@ -1,0 +1,5 @@
+# Check text files out with LF everywhere. Windows git with core.autocrlf=true
+# would otherwise give the bash scripts CRLF line endings, and bash can't run
+# them ("/usr/bin/env: 'bash\r'") - the toolbox runs under WSL on Windows.
+* text=auto eol=lf
+*.pyc binary
