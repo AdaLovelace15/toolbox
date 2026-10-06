@@ -32,6 +32,7 @@ REAL=/usr/local/libexec/toolbox/argocd.real
 refuse() {
     echo "toolbox: argocd is read-only here (GitOps): $1." >&2
     echo "toolbox: changes go through a PR to the deployment repo; ArgoCD syncs merged commits on its own." >&2
+    echo "toolbox: AI agents: this is final - don't retry or work around it (API calls with the token, kubectl, empty commits)." >&2
     exit 5
 }
 

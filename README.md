@@ -1,9 +1,11 @@
 # GlueOps Toolbox
 
 > **Beta.** Everything here is beta and may change or break. Only `argocd` and
-> `bao` (and the GitOps deploy flow) are in scope; the observability CLIs have known
-> issues and are switched off. Using it with AI agents is at your own risk, and by
-> doing so you accept that risk: [Beta and risk acceptance](HUMANS.md#beta-and-risk-acceptance).
+> `bao` (and the GitOps deploy flow built on them) are in scope. `promtool`,
+> `logcli`, `tempo-cli` and `grafana-ds` (Grafana) have known issues and are
+> switched off. Using the toolbox, yourself or through an AI agent, is at your
+> own risk, and by doing so you accept that risk:
+> [Beta and risk acceptance](HUMANS.md#beta-and-risk-acceptance).
 
 The GlueOps platform CLIs — `argocd`, `bao`, `helm` and the GitOps deploy flow —
 in one container, already wired up to authenticate against a GlueOps cluster.

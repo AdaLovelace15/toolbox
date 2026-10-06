@@ -75,7 +75,10 @@ RUN set -eux; \
     tar -xzf /tmp/tempo.tar.gz -C /usr/local/bin tempo-cli; \
     mv /usr/local/bin/tempo-cli /usr/local/libexec/toolbox/tempo-cli.real; \
     chmod +x /usr/local/libexec/toolbox/tempo-cli.real; \
-    rm -f /tmp/tempo.tar.gz
+    rm -f /tmp/tempo.tar.gz; \
+    /usr/local/libexec/toolbox/tempo-cli.real --help >/dev/null; \
+    # Owned by root, so the runtime user can't swap a gated binary for another.
+    chown -R root:root /usr/local/libexec/toolbox
 
 # helm (rendering deployment configs locally). Verified against the published
 # checksum, which sits next to the tarball.

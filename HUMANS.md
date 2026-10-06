@@ -1,9 +1,11 @@
 # GlueOps Toolbox — for humans
 
 > **Beta.** Everything here is beta and may change or break. Only `argocd` and
-> `bao` (and the GitOps deploy flow) are in scope; the observability CLIs have known
-> issues and are switched off. Using it with AI agents is at your own risk, and by
-> doing so you accept that risk: [Beta and risk acceptance](HUMANS.md#beta-and-risk-acceptance).
+> `bao` (and the GitOps deploy flow built on them) are in scope. `promtool`,
+> `logcli`, `tempo-cli` and `grafana-ds` (Grafana) have known issues and are
+> switched off. Using the toolbox, yourself or through an AI agent, is at your
+> own risk, and by doing so you accept that risk:
+> [Beta and risk acceptance](#beta-and-risk-acceptance).
 
 > AI agent? Read [AGENTS.md](AGENTS.md) instead; this file is for people.
 
@@ -54,12 +56,14 @@ GitOps deploy flow built on them (`helm`, `dyff`, `toolbox-app`,
 `promtool`, `logcli`, `tempo-cli` and `grafana-ds`. They have known issues and
 refuse to run (exit 5). A human at a terminal can switch them back on, unsupported
 and at their own risk, with `TOOLBOX_ENABLE_OBSERVABILITY=1 ./toolbox up <domain>`.
-`up` ignores the variable when an AI agent drives it, and switches the CLIs back
-off the next time an agent runs `up`. Agents decline these requests even when the
-CLIs are on.
+`up` ignores the variable when an AI agent drives it (or anything without a
+terminal), and any later `up` without it - including every `up` an agent runs -
+recreates the container with the CLIs off, dropping open `./toolbox shell`
+sessions. Commands an agent runs through `./toolbox` are refused even while the
+CLIs are on, and agents decline these requests regardless.
 
-**AI agents act with your credentials:** the toolbox token (ArgoCD, OpenBao
-`editor`, and the observability datasources behind Grafana) and, on the host,
+**AI agents act with your credentials:** the toolbox token (ArgoCD, OpenBao -
+`editor` by default - and the observability datasources behind Grafana) and, on the host,
 your `git`/`gh` login. The guardrails — read-only `argocd`, deploys only by pull
 request, agents declining out-of-scope requests — reduce that risk but don't
 remove it. They are guardrails, not security boundaries. You are responsible for
@@ -75,14 +79,17 @@ risks**, along with those under [Known risks](#known-risks) and
 Agents load instructions from the repository they are working in, and they
 usually work in your deployment-configurations clone — not here — so they don't
 see this repo's [CLAUDE.md](CLAUDE.md) or [AGENTS.md](AGENTS.md) on their own.
-`./toolbox up` prints the agent rules every time, but to be sure, add them to the
-deployment repo:
+`./toolbox up` prints the agent rules in brief every time and `./toolbox rules`
+prints them in full, but to be sure, add them to the deployment repo. They live
+on their own in [AGENT-RULES.md](AGENT-RULES.md):
 
-- **Claude Code:** in that repo's `CLAUDE.md` (or your `~/.claude/CLAUDE.md`),
-  add an import pointing at this repo, e.g. `@../toolbox/CLAUDE.md` when the two
-  clones are siblings.
-- **Codex, Cursor and others:** copy the `## Rules (beta)` block from the top of
-  [AGENTS.md](AGENTS.md) into that repo's `AGENTS.md`.
+- **Claude Code:** in that repo's `CLAUDE.md`, add `@../toolbox/AGENT-RULES.md`.
+  Relative imports resolve from the file that contains them, so this assumes the
+  two clones are siblings; from `~/.claude/CLAUDE.md`, use an absolute path. Claude
+  Code asks you to approve an import from outside the project the first time; if
+  you decline, the rules aren't loaded.
+- **Codex, Cursor and others:** copy [AGENT-RULES.md](AGENT-RULES.md) into that
+  repo's `AGENTS.md`.
 
 ## Why a container
 
@@ -128,6 +135,7 @@ terminal, `up` opens the browser and `wait` blocks until you've approved.
 | `./toolbox shell` | interactive shell |
 | `./toolbox status` | running? logged in? |
 | `./toolbox down` | remove the container; the login volume is kept |
+| `./toolbox rules` | the agent rules for the beta, in full ([AGENT-RULES.md](AGENT-RULES.md)) |
 | `./toolbox propose -m <why>` | from a deployment repo clone: commit the change on a branch, have ArgoCD render it, open (or update) a pull request — never on a branch ArgoCD deploys from, never merged. `--revert <sha>` reverts a merged change the same way. Needs `git` and `gh` on the host. Exit 0 PR opened, 3 no change, 2 failed |
 
 Overrides: `TOOLBOX_IMAGE`, `TOOLBOX_CONTAINER`, `TOOLBOX_VOLUME`,
@@ -172,7 +180,7 @@ container variable below is passed through if set.
 | `TOOLBOX_IDLE_SECONDS` | `14400` | How long a bare `docker run -d` container stays up |
 | `TOOLBOX_BAO_ROLES` | `editor,reader` | OpenBao roles tried at login, in order |
 | `TOOLBOX_BAO_AUTH_PATH` | `jwt` | OpenBao auth mount the CLI logs in through |
-| `TOOLBOX_ENABLE_OBSERVABILITY` | — | `1` switches `promtool`/`logcli`/`tempo-cli`/`grafana-ds` back on. Beta, unsupported, at your own risk; set on `up` from a terminal — ignored when an agent runs `up`. See [Beta and risk acceptance](#beta-and-risk-acceptance). |
+| `TOOLBOX_ENABLE_OBSERVABILITY` | — | `1` switches `promtool`/`logcli`/`tempo-cli`/`grafana-ds` back on. Beta, unsupported, at your own risk. Set it on `up` from a terminal: `up` ignores it when an agent drives it (or there is no terminal, e.g. CI), any later `up` without it switches the CLIs off again, and commands an agent runs are refused regardless. See [Beta and risk acceptance](#beta-and-risk-acceptance). |
 
 ## How it works
 
@@ -226,6 +234,10 @@ grant.
 
 The proxy binds to `127.0.0.1` only — it attaches your credential to whatever it
 forwards, so it must never be exposed.
+
+*The rest of this section describes `promtool`, `logcli` and `tempo-cli`, which
+are switched off during the beta (see [Beta and risk acceptance](#beta-and-risk-acceptance)):
+this is how they work when a human opts in.*
 
 **Grafana, Loki, Thanos and Tempo** need no proxy. `promtool`, `logcli` and
 `tempo-cli` all accept arbitrary headers, so each wrapper simply sends two:
@@ -311,13 +323,16 @@ convention, because nothing enforces it.
 
 If that convention is ever not enough, the enforcement point is the edge: a
 Traefik router rule matching `Method(`GET`)` on `/api/datasources/proxy/` would
-make the read-only intent real. It is deliberately not done today.
+make the read-only intent real. It is deliberately not done today. Switching the
+observability CLIs off during the beta doesn't close this either: the token
+still reaches Grafana's proxy directly.
 
 ## Known issues
 
 **The observability CLIs are switched off during the beta.** `promtool`,
 `logcli`, `tempo-cli` and `grafana-ds` have known issues and exit 5 with a
-refusal. See [Beta and risk acceptance](#beta-and-risk-acceptance).
+refusal. See [Beta and risk acceptance](#beta-and-risk-acceptance). It is a
+guardrail, not a security boundary: the binaries remain in the image.
 
 **An ArgoCD permission error can look like a login problem.** The `argocd` CLI
 speaks gRPC-web over root paths (`/application.ApplicationService/List` and
@@ -376,7 +391,7 @@ The platform must have a public Dex client matching `TOOLBOX_CLIENT_ID`, that
 audience accepted by oauth2-proxy (`oidc_extra_audiences`) and by ArgoCD
 (`allowedAudiences`), and jwt-type roles in OpenBao bound to it.
 
-For `promtool`/`logcli`/`tempo-cli`, Grafana additionally needs `[auth.jwt]`
+For `promtool`/`logcli`/`tempo-cli` (switched off during the beta; opt-in only), Grafana additionally needs `[auth.jwt]`
 enabled with `header_name = X-JWT-Assertion` and the same audience in
 `expect_claims` (GlueOps/k8s-monitoring-helm). Without it those three fail with a
 302 to the login page; `argocd` and `bao` are unaffected, so an older cluster
