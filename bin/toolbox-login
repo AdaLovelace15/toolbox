@@ -44,8 +44,10 @@ def already(token, exchange):
 
 def begin(force):
     if force:
-        # Discard the cached identity so --wait saves the new one cleanly.
+        # Discard the cached identity so --wait saves the new one cleanly - and
+        # the old identity's OpenBao token, which a failed exchange would leave.
         toolbox_auth._write_cache({})
+        toolbox_auth.forget_bao()
     elif toolbox_auth.get_token(interactive=False):
         # No OpenBao exchange here: it would race the proxy that the entrypoint
         # is still starting, and --wait does it anyway.
@@ -89,6 +91,8 @@ def wait():
 
 
 def interactive(force):
+    if force:
+        toolbox_auth.forget_bao()
     token = None if force else toolbox_auth.get_token(interactive=False)
     if token:
         return already(token, exchange=True)

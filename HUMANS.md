@@ -115,6 +115,30 @@ against a small public endpoint — not your cluster, which may be slow or priva
 networking; a TLS failure there means an interception CA the host doesn't have,
 and it says so. It prints each decision.
 
+**One cluster at a time.** The login lives in a volume (`glueops-toolbox`, or
+`glueops-<container>` with `TOOLBOX_CONTAINER`) that `up` labels with its cluster;
+the login inside also records its Dex issuer and client. `up` for a different
+captain domain — even after `down`, with no container left — removes the
+container and that volume before starting, so no token from the old cluster
+survives. `https://`, a trailing `/` or `.`, and capitals don't count as a
+different domain. `./toolbox reauth` does the same removal on demand. The tokens
+are removed from this machine, not revoked; they expire on their own. Switching
+back costs another sign-in - to keep two clusters signed in, give each its own
+container: `TOOLBOX_CONTAINER=toolbox-prod ./toolbox up prod…`.
+
+Only volumes the toolbox created are ever removed. `TOOLBOX_VOLUME` may name your
+own volume or a host directory; those are never removed (a cluster switch leaves
+them with a warning, and `reauth` refuses), and inside the container a cached
+login for another cluster is discarded rather than used, as a backstop. A login
+volume another container still uses stops both, before anything is removed.
+
+**Upgrading to this version:** everyone signs in once more, because logins cached
+before didn't record their cluster - once, if the script and the image are
+upgraded together (`git pull` and `docker pull ghcr.io/glueops/toolbox:latest`).
+A container started with `TOOLBOX_CONTAINER` set now gets its own
+`glueops-<name>` volume instead of sharing `glueops-toolbox`; if an old container
+still uses the shared volume, remove it (`docker rm -f <name>`).
+
 `up` also mounts the directory it was run from — or `TOOLBOX_WORKDIR` —
 read-only at the same path inside the container, and every `./toolbox <command>`
 starts in your current directory. So a deployment-configurations clone under it
@@ -135,6 +159,7 @@ terminal, `up` opens the browser and `wait` blocks until you've approved.
 | `./toolbox shell` | interactive shell |
 | `./toolbox status` | running? logged in? |
 | `./toolbox down` | remove the container; the login volume is kept |
+| `./toolbox reauth [<domain>]` | forget the login entirely — remove the container and its login volume — and run `up` from scratch. The same cluster unless you name another. To sign in as someone else, open the new URL in a private window or sign out of GitHub first |
 | `./toolbox rules` | the agent rules for the beta, in full ([AGENT-RULES.md](AGENT-RULES.md)) |
 | `./toolbox propose -m <why>` | from a deployment repo clone: commit the change on a branch, have ArgoCD render it, open (or update) a pull request — never on a branch ArgoCD deploys from, never merged. `--revert <sha>` reverts a merged change the same way. Needs `git` and `gh` on the host. Exit 0 PR opened, 3 no change, 2 failed |
 
@@ -156,7 +181,7 @@ container variable below is passed through if set.
 | `bao …` | OpenBao CLI, pointed at a local proxy that attaches your token. |
 | `toolbox-login` | Authenticate. Runs automatically on an interactive start. |
 | `toolbox-login --begin` / `--wait` | The same login in two halves: print the URL and return (idempotent), then wait for approval — about 90 s per call, exit 2 means call again. For callers that can't sit on a blocking command. |
-| `toolbox-login --force` | Re-authenticate, e.g. to switch accounts. |
+| `toolbox-login --force` | Start a fresh login inside the container. To wipe everything (tokens, the volume) and switch accounts or clusters, use `./toolbox reauth` from the host. |
 | `toolbox-token` | Print the raw token, for scripting. |
 | `promtool query instant\|range …` | **Switched off during the beta.** Prometheus CLI, pointed at Thanos. Metrics, plus alert state. The server argument is filled in for you. `query series`/`labels` and `debug` take no `--header`, so they cannot reach the cluster. |
 | `logcli …` | **Switched off during the beta.** Loki CLI. Log queries and `--tail`. |

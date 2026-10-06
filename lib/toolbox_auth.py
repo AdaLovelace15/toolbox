@@ -129,12 +129,65 @@ def probe():
     return PROBE_UNREACHABLE
 
 
+# The toolbox serves one cluster at a time. A cached login records which one it
+# belongs to - the Dex issuer and client it came from - because a token for one
+# cluster is no use on another and must never be sent there. Logins cached before
+# this was recorded can't be placed, so they are discarded too: one fresh sign-in.
+def cluster_id():
+    return {"dex": dex_url(), "client_id": client_id()}
+
+
+def forget_bao():
+    """Remove the OpenBao token, which belongs to whoever logged in last."""
+    try:
+        os.remove(bao_token_path())
+    except OSError:
+        pass
+
+
+def _discard_if_unchanged(path, f):
+    """Delete `path` only if it is still the file `f` has open. Compared while it
+    is open, so its inode can't be freed and reused by a concurrent writer's new
+    file; a writer landing between the stat and the remove is the one window left
+    (microseconds, and only on the first read after a cluster change). True if
+    it is gone."""
+    try:
+        if os.stat(path).st_ino == os.fstat(f.fileno()).st_ino:
+            os.remove(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def _read_cache():
     try:
         with open(cache_path()) as f:
-            return json.load(f)
+            obj = json.load(f)
+            if not isinstance(obj, dict) or not obj:
+                return {}
+            had = obj.get("cluster")
+            if had == cluster_id():
+                return obj
+            # Not ours: never use it, and remove it - unless another process has
+            # replaced it with a fresh login since it was read.
+            gone = _discard_if_unchanged(cache_path(), f)
     except (OSError, ValueError):
         return {}
+    if not isinstance(had, dict):
+        why = "records no cluster this toolbox understands (it is from an older version)"
+    elif had.get("dex") != dex_url():
+        why = f"was for {had.get('dex')}, not {dex_url()}"
+    elif had.get("client_id") != client_id():
+        why = f"was for client {had.get('client_id')}, not {client_id()}"
+    else:
+        why = "was for a different cluster"
+    if gone:
+        log(f"toolbox: the cached login {why}; discarded it - sign in again")
+    else:
+        log(f"toolbox: the cached login {why}; ignoring it (could not remove {cache_path()})")
+    return {}
 
 
 def _write_private_json(path, obj):
@@ -160,7 +213,7 @@ def _write_private_json(path, obj):
 
 
 def _write_cache(obj):
-    _write_private_json(cache_path(), obj)
+    _write_private_json(cache_path(), dict(obj, cluster=cluster_id()) if obj else {})
 
 
 def ssl_context():
@@ -254,6 +307,7 @@ def begin_device_flow(force=False):
         "interval": body.get("interval", 5),
         "expires_at": time.time() + body.get("expires_in", 300),
         "force": force,
+        "cluster": cluster_id(),
     }
     _write_private_json(pending_path(), pending)
     return pending
@@ -262,9 +316,14 @@ def begin_device_flow(force=False):
 def _read_pending():
     try:
         with open(pending_path()) as f:
-            return json.load(f)
+            obj = json.load(f)
+            if isinstance(obj, dict) and obj.get("cluster") == cluster_id():
+                return obj
+            # A code from another cluster's Dex can never be approved here.
+            _discard_if_unchanged(pending_path(), f)
     except (OSError, ValueError):
-        return None
+        pass
+    return None
 
 
 def _clear_pending():
