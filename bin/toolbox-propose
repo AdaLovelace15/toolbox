@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Container half of ./toolbox propose (plan and PR body). Run ./toolbox propose on the host instead.
+
+    toolbox-propose --help
+"""
+import sys
+
+sys.path.insert(0, "/opt/toolbox/lib")
+import toolbox_deploy  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(toolbox_deploy.main_propose(sys.argv[1:]))

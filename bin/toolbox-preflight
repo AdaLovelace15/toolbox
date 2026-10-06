@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Have ArgoCD render a pushed branch or commit of the deployment repo and compare it with its render of where that branch started. Read-only. Exit 0 no change, 1 change, 2 error.
+
+    toolbox-preflight --help
+"""
+import sys
+
+sys.path.insert(0, "/opt/toolbox/lib")
+import toolbox_deploy  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(toolbox_deploy.main_preflight(sys.argv[1:]))

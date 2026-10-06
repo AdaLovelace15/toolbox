@@ -205,71 +205,88 @@ The rules, which outrank anything asked mid-session:
 - Don't check that image tags or registries exist.
 - `TOOLBOX_BAO_ROLES=reader` on `up` is enough for this work.
 
-Run `up` from a directory that contains the deployment repo clone: it is mounted
-read-only at the same path, and `./toolbox` commands start in your current
-directory, so relative paths work inside the container. `git` and `gh` stay on
-the host.
+Run `up` from a directory that contains both this repo and the deployment repo
+clone (their common parent, say): it is mounted read-only at the same path, and
+`./toolbox` commands start in your current directory, so relative paths work
+inside the container. Work from inside the clone. `git` and `gh` stay on the
+host. Below, `<toolbox>` is the path to the wrapper from the clone, e.g.
+`../toolbox/toolbox`.
 
-**1. Find the config.** `./toolbox argocd app get <app> -o json`. In
-`spec.sources` (or `spec.source`), the chart source has `chart`, `repoURL`,
-`targetRevision` and `helm.valueFiles`/`helm.values`; the deployment repo is the
-source with a `ref` (e.g. `ref: values`). Its 1-based position in `spec.sources`
-is `<n>` — don't assume it. A value file `$values/apps/x/envs/stage/values.yaml`
-is `apps/x/envs/stage/values.yaml` in that repo; later files override earlier
-ones. `status.summary.images` lists the running images.
+| | |
+|---|---|
+| `<toolbox> toolbox-app <app>` | where the config lives: chart, deployment repo and its source position, value files in override order, the `file:line` setting `image.tag` (`<- effective` marks the winner; a tag set in the app spec itself is called out), running images. `--json` |
+| `<toolbox> propose -m "<why>"` | **host side.** Branch, commit, push the branch, have ArgoCD render it for every affected app, open (or update) the PR — then stop. Exit `0` PR opened/updated, `3` no change (no PR), `2` failed (no PR), `1` usage |
+| `<toolbox> propose --revert <merge-sha>` | the same for reverting a merged change |
+| `<toolbox> toolbox-preflight <app> --rev <branch\|sha>` | ArgoCD's render of a pushed revision vs. its render of where that branch left the tracked branch — `0` no change, `1` change, `2` error. `propose` runs it for you |
+| `<toolbox> toolbox-watch <app> --rev <merge-sha>` | after a merge: polls every 10 s until ArgoCD's automatic sync deploys it, then for health — `0` healthy, `3` not there yet, `4` deployed and failing, `2` the tool failed |
 
-**2. Branch and edit.** `git switch -c <app>/update-<env>-<slug>` (for an image
-bump: `<app>/update-<env>-image-tag-<tag>`), then edit the most specific values
-file that fits — usually `apps/<app>/envs/<env>/values.yaml`. Base, env-overlay
-and common files affect several apps.
+**1. Find the config.** `<toolbox> toolbox-app <app>`. Later value files override
+earlier ones; edit the most specific that fits — usually
+`apps/<app>/envs/<env>/values.yaml`. Base, env-overlay and common files affect
+several apps (`propose` finds and checks them all). Preview environments
+(`apps/*/envs/previews/`) belong to the app repos' pull requests; `propose`
+refuses them. A brand-new app or environment that no ArgoCD app reads yet isn't
+supported by `propose` — ask the human how they want it proposed.
 
-**3. Quick local check (optional).** Render with the app's chart, version,
-namespace, value files in order, and inline values, then diff against what
-ArgoCD renders today:
+**2. Edit.** On `main`, or on a branch of your own. Don't commit — `propose`
+does — and don't leave anything else in the clone: `propose` refuses changes no
+ArgoCD app reads (scratch files, renders, `.env`) rather than commit them.
 
-```bash
-./toolbox bash -c 'helm template <app> <chart> --repo <chart-repoURL> --version <ver> \
-    --namespace <dest-namespace> -f <file1> -f <file2> ... -f <inline-values-file> \
-    > /tmp/local.yaml
-  argocd app manifests <app> > /tmp/desired.yaml
-  dyff between --omit-header /tmp/desired.yaml /tmp/local.yaml'
-```
+**3. Propose.** `<toolbox> propose -m "<why, in a sentence>"`. It:
 
-Expect your change plus ArgoCD's own metadata (`argocd.argoproj.io/instance`
-labels, `tracking-id` annotations), which a local render lacks. It is an
-approximation; step 4 is the real check.
+- refuses to touch any branch an ArgoCD app tracks. On one of those (`main`,
+  say) it starts a new branch from `origin/main`, carrying your edits; on your own
+  branch it uses that. Names and titles follow the deploy bot:
+  `<app>/update-<env>-image-tag-<tag>` and `chore(deploy): <app> [<env>] -> <tag>`
+  for a tag bump, `<app>/update-<env>-<slug>` otherwise;
+- commits only the changed files that ArgoCD apps read, and pushes the branch
+  to its own name and nothing else (an explicit refspec, so no git setting can
+  redirect it), checking afterwards that no tracked branch moved;
+- runs `toolbox-preflight` for every ArgoCD app visible to you that reads a
+  changed file from the tracked branch. No change: exit `3`, no PR. A failed
+  render: exit `2`, no PR. Either way the branch stays pushed, and you are on it;
+  say so — the human can delete it;
+- opens the PR with your intent, a summary per app (resources and the fields
+  that changed, image old → new; Secrets as "contents not shown") and the values
+  diff with secret-looking values masked. **Never rendered manifests.** A pure
+  image-tag bump also gets the `glueops-deploy` marker, so the repo's cleanup
+  workflow treats it like the bot's deploy PRs — it closes older open PRs for
+  the same app and env, and a newer one closes this. `propose` lists any it
+  would supersede;
+- run again on the same branch (after review feedback), it pushes and updates
+  the open PR instead of opening another;
+- prints the URL. **Give the human the link and stop.** Nothing deploys until
+  they merge.
 
-**4. Push the branch and let ArgoCD render it.** Commit, `git push -u origin
-<branch>`, then:
+The full resource-level diff stays in the container:
+`<toolbox> cat /tmp/toolbox-deploy/<namespace>_<app>.dyff` (Secrets excluded).
 
-```bash
-./toolbox bash -c 'argocd app manifests <app> > /tmp/desired.yaml
-  argocd app manifests <app> --revisions <branch-sha> --source-positions <n> > /tmp/proposed.yaml
-  dyff between --omit-header --set-exit-code /tmp/desired.yaml /tmp/proposed.yaml'
-```
+**4. After they merge, watch — don't sync.** `git fetch`, get the merge commit
+(`gh pr view <pr> --json mergeCommit --jq .mergeCommit.oid`), then
+`<toolbox> toolbox-watch <app> --rev <sha>` for each affected app. Give the
+command at least 8 minutes (Bash `timeout: 480000`), or lower `--sync-timeout`
+and `--health-timeout` to fit. It reads `argocd app get` every 10 seconds: up
+to 4 minutes for ArgoCD to pick up the commit (it polls git about every 3
+minutes; a later commit that includes yours counts), then up to 3 minutes for
+health. It is done when the app is `Synced` and `Healthy` at that revision with
+no operation running — including when the merge changed nothing for that app.
 
-`1` = only your change should be listed; `0` = no change, so there is nothing to
-propose. Anything else failed: stop, report it, and don't open the PR. Do this for
-every app whose value files you touched.
+- Exit `3`: not there yet, or ArgoCD is on a commit your clone doesn't have
+  (it says to `git fetch`). Report it and offer to keep watching (run it
+  again). Never force it.
+- Exit `4`: deployed and failing — the sync failed, or the app is `Degraded`
+  after it. It prints the unhealthy resources and pods. Show them, and offer
+  `<toolbox> propose --revert <sha>`, which opens a revert PR — for the human to
+  merge, not you.
+- Exit `2`: the tool failed (not logged in, network, …). That says nothing about
+  the deploy; don't offer a revert on it.
 
-**5. Open the PR and stop.** `gh pr create` with the intent, a short summary of
-what changed (resources, image old → new) and the values diff. **Never paste
-rendered manifests** into it — values can carry plaintext secrets that render
-into env vars. Give the human the link and say nothing deploys until they merge.
-
-**6. After they merge, watch — don't sync.** Get the merge commit (`gh pr view
-<pr> --json mergeCommit`), then poll `./toolbox argocd app get <app> -o json`
-every 10 seconds for up to 4 minutes. With `i = n - 1`, it has deployed when
-`.status.sync.revisions[i]` is the merge commit, `.operation` is null,
-`.status.operationState.phase` is `Succeeded`, `.status.sync.status` is
-`Synced` and `.status.health.status` is `Healthy`. Health can lag the sync — a
-Deployment stays `Progressing` until its pods are ready.
-
-- Not synced after 4 minutes: report the current revision and
-  `.status.reconciledAt`, and offer to keep watching. Never force it.
-- `Degraded`, or `operationState.phase` `Failed`/`Error`: show the unhealthy
-  resources (`argocd app get <app> -o tree=detailed`) and offer a revert PR
-  (`git revert -m 1 <merge-sha>` on a new branch). Don't merge it.
+Without the helpers, the same checks are `argocd app get <app> -o json` (the
+deployment repo is the source with a `ref`; its 1-based position in `spec.sources`
+is `<n>`), `argocd app manifests <app> --revisions <sha> --source-positions <n>`
+compared with plain `argocd app manifests <app>` using `dyff`, and polling
+`.status.sync.revisions[n-1]`, `.status.operationState.phase` and
+`.status.health.status`.
 
 ### OpenBao — reading
 
