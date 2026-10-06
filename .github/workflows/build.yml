@@ -104,6 +104,12 @@ jobs:
           bad=$(git ls-files --eol | grep -v -e '^i/lf' -e '^i/-text' -e '^i/none' || true)
           if [ -n "$bad" ]; then echo "files with CRLF in the index:"; echo "$bad"; exit 1; fi
 
+      # What ./toolbox tells humans and agents on each platform when docker
+      # isn't ready - offline, with stub docker/uname.
+      - name: Wrapper messages
+        if: github.event_name == 'pull_request'
+        run: bash tests/wrapper-messages.sh
+
       - name: Host smoke test
         if: github.event_name == 'pull_request'
         env:
@@ -117,3 +123,19 @@ jobs:
         run: |
           docker run --rm -v "$PWD/tests:/tests:ro" --entrypoint python3 toolbox:ci \
             -m unittest discover -s /tests -p 'test_*.py' -v
+
+  # The wrapper on macOS's own bash 3.2 and BSD tools - nothing else in CI runs
+  # there. Stubbed, so it needs no docker. Free for public repositories.
+  macos:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Wrapper messages (bash 3.2)
+        run: |
+          /bin/bash --version | head -1
+          /bin/bash tests/wrapper-messages.sh

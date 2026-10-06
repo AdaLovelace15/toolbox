@@ -356,6 +356,12 @@ still reaches Grafana's proxy directly.
 
 ## Known issues
 
+**SELinux (Fedora, RHEL and similar with SELinux enforcing).** The read-only
+workdir mount can be unreadable inside the container (`Permission denied`), so
+`helm`, `toolbox-app`, `toolbox-preflight` and `propose` can't read the clone.
+Not handled yet; any workaround (relabelling the clone, disabling SELinux
+labelling for the container) is at your own risk.
+
 **The observability CLIs are switched off during the beta.** `promtool`,
 `logcli`, `tempo-cli` and `grafana-ds` have known issues and exit 5 with a
 refusal. See [Beta and risk acceptance](#beta-and-risk-acceptance). It is a
@@ -402,8 +408,9 @@ directory and the host's CA bundle. A local daemon is fine, even behind
 `DOCKER_HOST` or a docker context (rootless Docker, Colima, OrbStack, Docker
 Desktop); a daemon on another machine can't work. In a codespace or
 devcontainer that uses the host's docker, the workspace must be at the same path
-on the docker host (otherwise `up` fails with `bind source path does not
-exist`), and the CA bundle mounted is the docker host's, not the devcontainer's:
+on the docker host (otherwise `up` says `the docker daemon can't see ...`; and
+if that path happens to exist on the docker host too, the container silently
+sees the docker host's files instead), and the CA bundle mounted is the docker host's, not the devcontainer's:
 for a CA added only inside the devcontainer, point `TOOLBOX_EXTRA_CA` at a file
 the docker host can see. `propose` also needs `git` and `gh`.
 
@@ -425,6 +432,26 @@ internet: `TOOLBOX_IMAGE=ghcr.io/glueops/toolbox:latest bash tests/host-smoke.sh
 | Windows: Git Bash, PowerShell, cmd - including AI agents running natively on Windows (Claude Code for Windows runs commands in Git Bash) | Not supported (`up` refuses): run the toolbox, and your agent, inside WSL2 |
 | A docker daemon on another machine (`ssh://`, or `tcp://` to another host) | Not supported |
 
+### macOS
+
+Untested so far (see the table above). What is known:
+
+- **Keep clones under your home directory.** Docker Desktop shares `/Users`,
+  `/Volumes`, `/private` and `/tmp` by default (Settings > Resources > File
+  sharing); Colima shares only `~` (or `colima start --mount <dir>:w`); OrbStack
+  shares everything. If docker can't see the working directory, `up` says
+  `the docker daemon can't see ...` and how to fix it. Clones under
+  `~/Documents`, `~/Desktop` or `~/Downloads` may also need the docker app
+  allowed in System Settings > Privacy & Security.
+- **Corporate CAs** live in the Keychain, which the container can't see:
+  `security find-certificate -a -p /Library/Keychains/System.keychain > ~/corp-ca.pem`,
+  then `TOOLBOX_EXTRA_CA=~/corp-ca.pem ./toolbox up <domain>`.
+- **A proxy on the Mac's loopback** (`HTTPS_PROXY=http://127.0.0.1:...`) can't be
+  reached from containers; `up` says so. Pointing it at `host.docker.internal`
+  instead is untested.
+- **Apple Silicon** runs the native arm64 image; `up` ignores
+  `DOCKER_DEFAULT_PLATFORM` so docker doesn't emulate amd64.
+
 ### Windows
 
 Everything runs inside WSL2: the toolbox, `git`, `gh`, and your AI agent.
@@ -435,7 +462,7 @@ Everything runs inside WSL2: the toolbox, `git`, `gh`, and your AI agent.
   Docker Engine wants systemd in WSL (`[boot]` `systemd=true` in
   `/etc/wsl.conf`, which current Ubuntu images set). If the daemon isn't
   running, `up` says `cannot connect to the docker daemon`: run
-  `sudo systemctl start docker`.
+  `sudo service docker start` (works with or without systemd).
 - **Clone inside WSL** (`cd ~ && git clone ...`) with WSL's `git` - this repo
   *and* your deployment repo. Don't clone onto `C:` or use Windows git on the
   same clone: `/mnt/c` is much slower, its permissions didn't work for a normal
@@ -455,7 +482,8 @@ Everything runs inside WSL2: the toolbox, `git`, `gh`, and your AI agent.
   variables in WSL; export the company CA from Windows to a `.crt` file and run
   `TOOLBOX_EXTRA_CA=/path/to/ca.crt ./toolbox up <domain>`.
 - **Paths** are WSL paths (`/home/...`), never `C:\...` - including
-  `TOOLBOX_WORKDIR`.
+  `TOOLBOX_WORKDIR`. `up` warns when the workdir is on the Windows drive.
+- **WSL mirrored networking**, and a proxy on Windows' loopback, are untested.
 - **AI agents.** Run Claude Code, Codex or Cursor inside WSL, e.g. VS Code
   connected to WSL. Claude Code installed natively on Windows runs commands in
   Git Bash, which isn't supported.

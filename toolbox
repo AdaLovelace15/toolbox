@@ -49,6 +49,16 @@ WORKDIR=""
 
 log() { printf 'toolbox: %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
+# A step only the human can take - installing or starting docker, group changes,
+# sudo, moving a clone, a sandbox setting. Agents are told to pass it on and stop.
+die_human() {  # what is wrong, what the human does
+    log "$1"
+    log "ask the human to: $2"
+    if agent_mode; then
+        log "agents: give the human that line and stop - don't run sudo, install or start anything, change groups, edit or move files, or retry from another directory or with plain docker"
+    fi
+    exit 1
+}
 
 usage() {
     # The header up to its '# ---' line is the help text.
@@ -78,10 +88,68 @@ container_workdir() {
 }
 
 # ---------------------------------------------------------------- docker ----
+# WSL1 and WSL2 kernels say so in their release (and a test can fake uname).
+is_wsl() { case "$(uname -r 2>/dev/null)" in *[Mm]icrosoft*|*WSL*) return 0 ;; esac; return 1; }
+
+# Where this docker CLI talks to - works with no daemon running.
+docker_endpoint() {
+    if [ -n "${DOCKER_HOST:-}" ]; then printf '%s' "$DOCKER_HOST"; return 0; fi
+    docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true
+}
+
+# Is $1 in the docker group in /etc/group, as opposed to this session's groups?
+in_docker_group_file() {
+    local u=$1 line
+    line=$(grep '^docker:' "${TOOLBOX_GROUP_FILE:-/etc/group}" 2>/dev/null || true)   # overridable for tests
+    case ",${line##*:}," in *",$u,"*) return 0 ;; esac
+    return 1
+}
+
+# Docker must be reachable. When it isn't, say why and what the human does about
+# it - by where the CLI points (Docker Desktop, Colima, OrbStack, rootless,
+# Podman, the system socket) rather than by OS alone - ending with docker's own
+# words, so a case not listed here still reaches the reader.
 need_docker() {
-    command -v docker >/dev/null 2>&1 || die "docker is not installed"
-    docker info >/dev/null 2>&1 && return 0
-    if command -v dockerd >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
+    local os out err said ep start u p
+    os=$(uname -s)
+    if ! command -v docker >/dev/null 2>&1; then
+        if [ "$os" = Darwin ]; then
+            die_human "docker is not installed" "install Docker Desktop, OrbStack or Colima (Docker Desktop must be opened once to install the docker command)"
+        elif is_wsl; then
+            die_human "docker is not installed in this WSL distro" "install Docker Engine inside WSL, or start Docker Desktop on Windows and turn on its WSL integration for this distro (HUMANS.md#windows)"
+        else
+            die_human "docker is not installed" "install Docker Engine (in a devcontainer: a docker feature). A cloud or agent sandbox without docker can't run the toolbox"
+        fi
+    fi
+    # version rather than info: cheaper on Docker Desktop, and it names Podman.
+    if out=$(docker version 2>/dev/null); then
+        case "$out" in *[Pp]odman*) log "this docker is Podman, which the toolbox hasn't been tested with; if anything below fails, say so and stop" ;; esac
+        return 0
+    fi
+    err=$(docker version 2>&1 >/dev/null) || true
+    err=${err%%$'\n'*}
+    said=${err:+ (docker: $err)}
+    ep=$(docker_endpoint)
+    case "$err" in
+        *[Oo]peration\ not\ permitted*)
+            die_human "this process isn't allowed to reach docker - usually the AI agent's sandbox$said" "let ./toolbox run outside the agent's sandbox (Claude Code: allow it to run unsandboxed)" ;;
+        *[Pp]ermission\ denied*)
+            u=$(id -un 2>/dev/null || true)
+            case " $(id -Gn 2>/dev/null || true) " in
+                *" docker "*)
+                    die_human "docker refused this user's connection${ep:+ to $ep}$said" "check that socket's permissions, or the agent's sandbox settings" ;;
+            esac
+            if [ -n "$u" ] && in_docker_group_file "$u"; then
+                die_human "this user was added to the docker group, but this session started before that$said" "close this terminal and the AI agent, open a new terminal and start the agent again (WSL: if that isn't enough, run wsl --shutdown in Windows first)"
+            fi
+            case "$ep" in
+                ""|unix:///var/run/docker.sock|unix:///run/docker.sock)
+                    die_human "docker is running but this user can't use it$said" "sudo usermod -aG docker \$USER (the docker group is root-equivalent), then restart the terminal and the AI agent" ;;
+            esac
+            die_human "docker refused this user's connection to $ep$said" "check that socket's permissions, or the agent's sandbox settings" ;;
+    esac
+    # Not running. On plain Linux as root, start dockerd ourselves.
+    if [ -z "${DOCKER_HOST:-}" ] && command -v dockerd >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
         log "docker daemon is not running; starting dockerd (log: /tmp/toolbox-dockerd.log)"
         nohup dockerd >/tmp/toolbox-dockerd.log 2>&1 &
         local i
@@ -91,7 +159,26 @@ need_docker() {
         done
         die "dockerd did not come up within 40s - see /tmp/toolbox-dockerd.log"
     fi
-    die "cannot connect to the docker daemon - is it running, and can this user reach it?"
+    case "$ep" in
+        *"/.docker/run/"*|*"/.docker/desktop/"*) start="start Docker Desktop" ;;
+        *"/.colima/"*)
+            p=${ep#*/.colima/}; p=${p%%/*}
+            if [ -z "$p" ] || [ "$p" = default ]; then start="colima start"; else start="colima start --profile $p"; fi ;;
+        *"/.orbstack/"*) start="start OrbStack" ;;
+        *[Pp]odman*)
+            if [ "$os" = Darwin ]; then start="podman machine start"; else start="systemctl --user start podman.socket"; fi ;;
+        unix:///run/user/*) start="systemctl --user start docker (rootless docker - no sudo)" ;;
+        ssh://*|tcp://*)
+            case "$ep" in
+                tcp://localhost*|tcp://127.*|tcp://\[::1\]*) start="start the docker daemon listening on $ep" ;;
+                *) die_human "docker at $ep is on another machine, which can't work: up mounts this machine's files$said" "point docker at a daemon on this machine (HUMANS.md#platforms)" ;;
+            esac ;;
+        *)
+            if [ "$os" = Darwin ]; then start="start your docker app: Docker Desktop, OrbStack, or colima start"
+            elif is_wsl; then start="sudo service docker start (Docker Engine in WSL), or start Docker Desktop on Windows with WSL integration on for this distro"
+            else start="sudo service docker start"; fi ;;
+    esac
+    die_human "cannot connect to the docker daemon${ep:+ at $ep}$said" "$start"
 }
 
 # -------------------------------------------------------------- environment --
@@ -102,11 +189,13 @@ need_docker() {
 # only the extra CA rather than a full bundle; fine either way, since the
 # container loads it in addition to its own system store, never instead of it.
 host_ca_bundle() {
-    local f
+    local f sys="/etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem"
+    # macOS: /etc/ssl/cert.pem may not be shared with Docker Desktop's VM, and a
+    # corporate CA lives in the Keychain, not there - TOOLBOX_EXTRA_CA covers it.
+    if [ "$(uname -s)" = Darwin ]; then sys=""; fi
+    # shellcheck disable=SC2086  # $sys is a list of fixed paths
     for f in "${CURL_CA_BUNDLE:-}" "${SSL_CERT_FILE:-}" "${REQUESTS_CA_BUNDLE:-}" \
-             "${NIX_SSL_CERT_FILE:-}" "${NODE_EXTRA_CA_CERTS:-}" \
-             /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
-             /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+             "${NIX_SSL_CERT_FILE:-}" "${NODE_EXTRA_CA_CERTS:-}" $sys; do
         if [ -n "$f" ] && [ -f "$f" ] && [ -r "$f" ]; then printf '%s' "$f"; return 0; fi
     done
     return 0
@@ -186,7 +275,23 @@ run_container() {  # $1 = bridge|host
     fi
     [ -n "$ca" ] && log "trusting host CA bundle: $ca"
 
-    docker run "${args[@]}" "$IMAGE" >/dev/null
+    local err rc=0 path what
+    err=$(docker run "${args[@]}" "$IMAGE" 2>&1 >/dev/null) || rc=$?
+    if [ "$rc" = 0 ]; then
+        if [ -n "$err" ]; then printf '%s\n' "$err" >&2; fi   # docker's warnings
+        return 0
+    fi
+    printf '%s\n' "$err" >&2
+    case "$err" in
+        *"bind source path does not exist"*|*"Mounts denied"*|*"is not shared from the host"*)
+            case "$err" in
+                *"$WORKDIR"*) path=$WORKDIR; what="the working directory" ;;
+                *) path=$(printf '%s\n' "$err" | sed -n 's/.*does not exist: *\([^ ]*\).*/\1/p; s/.*The path \([^ ]*\) is not shared.*/\1/p')
+                   path=${path%%$'\n'*}; what="a file up mounts, such as a CA bundle" ;;
+            esac
+            die_human "the docker daemon can't see ${path:-a path up mounts} ($what)" "make it visible to docker: Colima shares only the home directory (keep it under ~, or colima start --mount <dir>:w); Docker Desktop: Settings > Resources > File sharing; in a devcontainer the workspace must be at the same path on the docker host; a docker daemon on another machine can't work (HUMANS.md#platforms)" ;;
+    esac
+    exit "$rc"
 }
 
 # Agent mode: driven by an AI (Claude Code exports CLAUDECODE) or anything else
@@ -212,8 +317,10 @@ begin() {
 open_browser() {
     local url=$1
     # WSL: wslview (from wslu) opens the Windows browser; xdg-open there often can't.
-    if grep -qi microsoft /proc/version 2>/dev/null && command -v wslview >/dev/null 2>&1; then
+    if is_wsl && command -v wslview >/dev/null 2>&1; then
         wslview "$url" >/dev/null 2>&1 &
+    elif is_wsl && command -v explorer.exe >/dev/null 2>&1; then
+        explorer.exe "$url" >/dev/null 2>&1 &
     elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 &
     elif command -v open >/dev/null 2>&1; then open "$url" >/dev/null 2>&1 &
     fi
@@ -373,6 +480,11 @@ cmd_up() {
     if agent_mode; then unset TOOLBOX_ENABLE_OBSERVABILITY; fi
     beta_notice
     resolve_workdir
+    if is_wsl; then
+        case "$WORKDIR" in /mnt/[a-z]|/mnt/[a-z]/*)
+            log "the workdir $WORKDIR is on the Windows drive: slow, and git there may fail for a normal user - HUMANS.md#windows recommends a clone under ~" ;;
+        esac
+    fi
     need_docker
 
     # One cluster at a time. The container (running or not) and the login volume
@@ -420,20 +532,34 @@ cmd_up() {
         else
             log "reusing the running container (workdir $mounted)"
             check_gate
-            login; return
+            if login; then return 0; fi
+            # e.g. an earlier up was cut off before its network checks: start over.
+            log "the running container can't log in; recreating it"
         fi
     fi
     log "workdir: $WORKDIR (read-only)"
     docker rm -f "$NAME" >/dev/null 2>&1 || true
 
+    if [ -n "${DOCKER_DEFAULT_PLATFORM:-}" ]; then
+        # The image is multi-arch; anything but the native one is emulated (slow).
+        log "ignoring DOCKER_DEFAULT_PLATFORM=$DOCKER_DEFAULT_PLATFORM - the image is multi-arch, docker picks the native one"
+        unset DOCKER_DEFAULT_PLATFORM
+    fi
     if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-        log "pulling $IMAGE"
+        log "pulling $IMAGE - about 400 MB the first time, so this can take minutes. If your command times out, run the same up again: it resumes"
         docker pull -q "$IMAGE" >/dev/null
     fi
 
     ensure_volume
     local net=bridge rc
-    proxy_is_loopback && net=host
+    if proxy_is_loopback; then
+        if [ "$(uname -s)" = Darwin ]; then
+            # Host networking on Docker Desktop, OrbStack or Colima is the VM's, not the Mac's.
+            log "the proxy is on this Mac's loopback, which containers can't reach; point HTTPS_PROXY at host.docker.internal instead (untested)"
+        else
+            net=host
+        fi
+    fi
     run_container "$net"
 
     # Egress first, cheaply. No egress from the bridge is the common sandbox
@@ -502,6 +628,11 @@ cmd_exec() {
         cd "$1" 2>/dev/null; shift; exec "$@"' bash "$(pwd -P)" "$@"
     rc=$?
     set -e
+    if [ "$rc" != 0 ] && [ "$rc" != 127 ] \
+       && [ "$(docker container inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" != true ]; then
+        docker version >/dev/null 2>&1 || need_docker
+        log "the toolbox container isn't running (docker restarted, or the machine slept?) - run ./toolbox up <domain> again"
+    fi
     if [ "$rc" = 127 ]; then
         case "$1" in *.real) log "'$1' is not available: it is out of scope during the beta (rule 2)"; return "$rc" ;; esac
         log "'$1' was not found in the container. If it is new, the image predates these scripts: docker pull $IMAGE && ./toolbox up <domain>"
@@ -568,7 +699,8 @@ push_branch() {  # repo branch tracked...
     local guards=() t before after
     for t in "$@"; do guards+=("refs/heads/$t"); done
     before=$(git -C "$repo" ls-remote origin "${guards[@]}")
-    git -C "$repo" push -q origin "refs/heads/$branch:refs/heads/$branch" || die "git push of $branch failed"
+    git -C "$repo" push -q origin "refs/heads/$branch:refs/heads/$branch" \
+        || die_human "git push of $branch failed (git's message is above)" "fix git's credentials for origin (e.g. gh auth setup-git), then ask you to run propose again - don't change the remote or put a token in a URL"
     after=$(git -C "$repo" ls-remote origin "${guards[@]}")
     [ "$before" = "$after" ] || die "a tracked branch on origin changed during the push - check $* on origin now"
     git -C "$repo" branch -q --set-upstream-to "origin/$branch" "$branch" >/dev/null 2>&1 || true
@@ -621,8 +753,8 @@ cmd_propose() {
             *) die "usage: toolbox propose -m <intent> [--repo DIR] | toolbox propose --revert <merge-sha> [-m <reason>] [--repo DIR]" ;;
         esac
     done
-    command -v gh >/dev/null 2>&1 || die "propose needs the GitHub CLI (gh) on this host"
-    gh auth status >/dev/null 2>&1 || die "gh is not logged in: gh auth login"
+    command -v gh >/dev/null 2>&1 || die_human "propose needs the GitHub CLI (gh) on this host" "install gh (on Windows: inside WSL), then ask you to run propose again"
+    gh auth status >/dev/null 2>&1 || die_human "gh is not logged in on this host" "run gh auth login in their own terminal (on Windows: inside WSL), then ask you to run propose again"
     local repo repo_p base cur k v
     repo=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) \
         || die "$dir is not in a git repository; cd into the deployment repo clone or pass --repo"
