@@ -115,8 +115,11 @@ Its last lines say what happened. The cases:
   too, no container flag will change it.
 - **`the code expired`** or **`login access_denied`** from `wait` — run
   `./toolbox up <domain>` again and show the new URL.
-- **Told to log in as someone else** — `./toolbox toolbox-login --begin --force`
-  discards the cached identity and mints a fresh URL, then `./toolbox wait`.
+- **Asked to log in again, as someone else, or to another cluster** —
+  `./toolbox reauth [<captain-domain>]`. It removes the container and the login
+  volume (every cached token and half-finished login) and runs `up` from scratch:
+  show the new URL, then `./toolbox wait`. The toolbox serves one cluster at a
+  time, and `up` for a different domain does the same removal by itself.
 
 ## Do not
 
@@ -398,7 +401,7 @@ non-zero as "check which", not as "there is drift".
 - **`TOOLBOX_BAO_ROLES=reader` constrains you** to read and list, enforced
   server-side — writes return `403 permission denied`. Worth setting on the run
   command when you know the task is read-only, so a mistake cannot land.
-- **Clean up with `./toolbox down`**; it keeps the volume, which holds the login,
+- **Clean up with `./toolbox down`**; it keeps the volume, which holds the login (for this cluster),
   so the human isn't asked to approve again next time. (An abandoned container
   stops itself after four hours — `TOOLBOX_IDLE_SECONDS` — but don't rely on
   that.)

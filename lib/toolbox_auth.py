@@ -129,12 +129,37 @@ def probe():
     return PROBE_UNREACHABLE
 
 
+# The toolbox serves one cluster at a time. A cached login records which one it
+# belongs to - the Dex issuer and client it came from - because a token for one
+# cluster is no use on another and must never be sent there. Logins cached before
+# this was recorded can't be placed, so they are discarded too: one fresh sign-in.
+def cluster_id():
+    return {"dex": dex_url(), "client_id": client_id()}
+
+
+def forget_login(reason=None):
+    """Remove the cached login and any half-finished one."""
+    for p in (cache_path(), pending_path()):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    if reason:
+        log(f"toolbox: {reason}")
+
+
 def _read_cache():
     try:
         with open(cache_path()) as f:
-            return json.load(f)
+            obj = json.load(f)
     except (OSError, ValueError):
         return {}
+    if not isinstance(obj, dict) or not obj:
+        return {}
+    if obj.get("cluster") != cluster_id():
+        forget_login(f"the cached login is not for {dex_url()}; discarded it - sign in again")
+        return {}
+    return obj
 
 
 def _write_private_json(path, obj):
@@ -160,7 +185,7 @@ def _write_private_json(path, obj):
 
 
 def _write_cache(obj):
-    _write_private_json(cache_path(), obj)
+    _write_private_json(cache_path(), dict(obj, cluster=cluster_id()) if obj else {})
 
 
 def ssl_context():
@@ -254,6 +279,7 @@ def begin_device_flow(force=False):
         "interval": body.get("interval", 5),
         "expires_at": time.time() + body.get("expires_in", 300),
         "force": force,
+        "cluster": cluster_id(),
     }
     _write_private_json(pending_path(), pending)
     return pending
@@ -262,9 +288,13 @@ def begin_device_flow(force=False):
 def _read_pending():
     try:
         with open(pending_path()) as f:
-            return json.load(f)
+            obj = json.load(f)
     except (OSError, ValueError):
         return None
+    if not isinstance(obj, dict) or obj.get("cluster") != cluster_id():
+        _clear_pending()   # a code from another cluster's Dex can never be approved here
+        return None
+    return obj
 
 
 def _clear_pending():

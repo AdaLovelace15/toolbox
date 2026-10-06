@@ -10,6 +10,7 @@
 #   toolbox shell                 interactive shell in the container
 #   toolbox status                is it running, is it logged in
 #   toolbox down                  remove the container (the login cache volume is kept)
+#   toolbox reauth [<domain>]     forget the login entirely and sign in again from scratch
 #   toolbox propose -m <intent>   commit the deployment repo change on a branch, have
 #                                 ArgoCD render it, open a PR, stop (never main, never merge)
 #   toolbox propose --revert <sha>  the same, reverting a merged change
@@ -18,6 +19,10 @@
 # The directory `up` runs in (or TOOLBOX_WORKDIR) is mounted read-only at the
 # same path, and commands start in your current directory, so helm can render a
 # deployment-configurations clone that lives under it.
+#
+# One cluster at a time: `up` for a different captain domain removes the
+# container and the login volume first, so nothing from the old cluster's
+# login survives.
 # ---
 #
 # `up` deals with the environment so nobody has to: starts dockerd if it is
@@ -218,9 +223,9 @@ login() {
     esac
 }
 
-container_env() {  # $1 = variable name
+container_env() {  # $1 = variable name; empty when there is no container
     docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
-        | sed -n "s/^$1=//p"
+        | sed -n "s/^$1=//p" || true
 }
 container_domain() { container_env TOOLBOX_CAPTAIN_DOMAIN; }
 
@@ -261,6 +266,15 @@ check_gate() {
         || log "WARNING: this image predates the beta gate, so the observability CLIs are NOT switched off: docker pull $IMAGE && ./toolbox down && ./toolbox up <domain>"
 }
 
+# Remove the container and the login volume: every token and half-finished login.
+forget_everything() {
+    docker rm -f "$NAME" >/dev/null 2>&1 || true
+    if docker volume inspect "$VOLUME" >/dev/null 2>&1; then
+        docker volume rm "$VOLUME" >/dev/null \
+            || die "could not remove the login volume $VOLUME (is another container using it? docker ps -a --filter volume=$VOLUME)"
+    fi
+}
+
 cmd_up() {
     DOMAIN="${1:-${TOOLBOX_CAPTAIN_DOMAIN:-}}"
     [ -n "$DOMAIN" ] || die "usage: toolbox up <captain-domain>   (e.g. prod.foobar.onglueops.com)"
@@ -277,7 +291,8 @@ cmd_up() {
         local mounted
         mounted=$(container_workdir)
         if [ "$(container_domain)" != "$DOMAIN" ]; then
-            log "running container is for $(container_domain); replacing it"
+            log "switching cluster: $(container_domain) -> $DOMAIN; removing the old container and its login"
+            forget_everything
         elif ! is_inside "$WORKDIR" "$mounted"; then
             # Mounts are fixed at creation. The login lives in the volume, so
             # recreating costs nothing but any command running in it right now.
@@ -290,6 +305,12 @@ cmd_up() {
             check_gate
             login; return
         fi
+    fi
+    local old
+    old=$(container_domain)
+    if [ -n "$old" ] && [ "$old" != "$DOMAIN" ]; then
+        log "switching cluster: $old -> $DOMAIN; removing the old container and its login"
+        forget_everything
     fi
     log "workdir: $WORKDIR (read-only)"
     docker rm -f "$NAME" >/dev/null 2>&1 || true
@@ -562,6 +583,18 @@ cmd_propose() {
     propose_publish "$repo" "$repo_p" "$base" "$branch" "$title" "$intent" "" "$mapp" "$menv" "${tracked[@]}"
 }
 
+# Sign in again from scratch: no cached token, refresh token, half-finished
+# login or OpenBao token survives. Same cluster unless a domain is given.
+cmd_reauth() {
+    need_docker
+    local domain="${1:-$(container_domain)}"
+    domain="${domain:-${TOOLBOX_CAPTAIN_DOMAIN:-}}"
+    [ -n "$domain" ] || die "usage: toolbox reauth <captain-domain>   (no container to take it from)"
+    log "re-authenticating to $domain: removing the container and the login volume"
+    forget_everything
+    cmd_up "$domain"
+}
+
 cmd_status() {
     local st
     st=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo "absent")
@@ -587,6 +620,7 @@ case "${1:-}" in
     status)  cmd_status ;;
     propose) shift; cmd_propose "$@" ;;
     rules)   cmd_rules ;;
+    reauth)  shift; cmd_reauth "$@" ;;
     down)    docker rm -f "$NAME" >/dev/null 2>&1 && log "removed $NAME (volume $VOLUME kept)" ;;
     -h|--help|help|"") usage 0 ;;
     *)       cmd_exec "$@" ;;
