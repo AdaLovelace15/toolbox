@@ -75,6 +75,13 @@ jobs:
         run: |
           docker run --rm -v "$PWD/tests:/tests:ro" --entrypoint bash toolbox:ci /tests/argocd-guard.sh
 
+      # During the beta the observability CLIs refuse unless a human opts in.
+      # No network: the refusal must happen before any token or request.
+      - name: Observability gate
+        if: github.event_name == 'pull_request'
+        run: |
+          docker run --rm --network none -v "$PWD/tests:/tests:ro" --entrypoint bash toolbox:ci /tests/observability-gate.sh
+
       # The deploy helpers' logic (source positions, diffs, watch states, PR
       # naming) against fakes - no server, no network.
       - name: Unit tests

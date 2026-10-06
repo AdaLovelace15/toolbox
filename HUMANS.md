@@ -1,5 +1,10 @@
 # GlueOps Toolbox — for humans
 
+> **Beta.** Everything here is beta and may change or break. Only `argocd` and
+> `bao` (and the GitOps deploy flow) are in scope; the observability CLIs have known
+> issues and are switched off. Using it with AI agents is at your own risk, and by
+> doing so you accept that risk: [Beta and risk acceptance](HUMANS.md#beta-and-risk-acceptance).
+
 > AI agent? Read [AGENTS.md](AGENTS.md) instead; this file is for people.
 
 The platform CLIs in one container, already wired up to authenticate. Developers
@@ -35,6 +40,49 @@ through a pull request to the deployment repo (see
 
 > Mount the named volume. Without it the login is thrown away when the container
 > exits and you re-authenticate every run.
+
+## Beta and risk acceptance
+
+**Everything in the toolbox is beta.** Commands, behaviour and defaults may
+change, be switched off or be removed without notice. It is provided "as is",
+without warranty, under the Apache 2.0 [LICENSE](LICENSE). This notice doesn't
+change the LICENSE or any agreement you have with GlueOps.
+
+**In scope:** `argocd` (read-only, including `argocd app logs`), `bao`, and the
+GitOps deploy flow built on them (`helm`, `dyff`, `toolbox-app`,
+`toolbox-preflight`, `toolbox-watch`, `./toolbox propose`). **Out of scope:**
+`promtool`, `logcli`, `tempo-cli` and `grafana-ds`. They have known issues and
+refuse to run (exit 5). A human at a terminal can switch them back on, unsupported
+and at their own risk, with `TOOLBOX_ENABLE_OBSERVABILITY=1 ./toolbox up <domain>`.
+`up` ignores the variable when an AI agent drives it, and switches the CLIs back
+off the next time an agent runs `up`. Agents decline these requests even when the
+CLIs are on.
+
+**AI agents act with your credentials:** the toolbox token (ArgoCD, OpenBao
+`editor`, and the observability datasources behind Grafana) and, on the host,
+your `git`/`gh` login. The guardrails — read-only `argocd`, deploys only by pull
+request, agents declining out-of-scope requests — reduce that risk but don't
+remove it. They are guardrails, not security boundaries. You are responsible for
+what an agent does with the toolbox, including reviewing every pull request before
+you merge it.
+
+**By using the toolbox, or letting an AI agent use it for you, you accept these
+risks**, along with those under [Known risks](#known-risks) and
+[Known issues](#known-issues).
+
+### Using an agent from your deployment repo
+
+Agents load instructions from the repository they are working in, and they
+usually work in your deployment-configurations clone — not here — so they don't
+see this repo's [CLAUDE.md](CLAUDE.md) or [AGENTS.md](AGENTS.md) on their own.
+`./toolbox up` prints the agent rules every time, but to be sure, add them to the
+deployment repo:
+
+- **Claude Code:** in that repo's `CLAUDE.md` (or your `~/.claude/CLAUDE.md`),
+  add an import pointing at this repo, e.g. `@../toolbox/CLAUDE.md` when the two
+  clones are siblings.
+- **Codex, Cursor and others:** copy the `## Rules (beta)` block from the top of
+  [AGENTS.md](AGENTS.md) into that repo's `AGENTS.md`.
 
 ## Why a container
 
@@ -102,10 +150,10 @@ container variable below is passed through if set.
 | `toolbox-login --begin` / `--wait` | The same login in two halves: print the URL and return (idempotent), then wait for approval — about 90 s per call, exit 2 means call again. For callers that can't sit on a blocking command. |
 | `toolbox-login --force` | Re-authenticate, e.g. to switch accounts. |
 | `toolbox-token` | Print the raw token, for scripting. |
-| `promtool query instant\|range …` | Prometheus CLI, pointed at Thanos. Metrics, plus alert state. The server argument is filled in for you. `query series`/`labels` and `debug` take no `--header`, so they cannot reach the cluster. |
-| `logcli …` | Loki CLI. Log queries and `--tail`. |
-| `tempo-cli query api …` | Tempo CLI. TraceQL search and trace lookup. |
-| `grafana-ds <type>` | Print a datasource UID (`prometheus`/`loki`/`tempo`); used by the wrappers. |
+| `promtool query instant\|range …` | **Switched off during the beta.** Prometheus CLI, pointed at Thanos. Metrics, plus alert state. The server argument is filled in for you. `query series`/`labels` and `debug` take no `--header`, so they cannot reach the cluster. |
+| `logcli …` | **Switched off during the beta.** Loki CLI. Log queries and `--tail`. |
+| `tempo-cli query api …` | **Switched off during the beta.** Tempo CLI. TraceQL search and trace lookup. |
+| `grafana-ds <type>` | **Switched off during the beta.** Print a datasource UID (`prometheus`/`loki`/`tempo`); used by the wrappers. |
 
 
 ## Configuration
@@ -124,6 +172,7 @@ container variable below is passed through if set.
 | `TOOLBOX_IDLE_SECONDS` | `14400` | How long a bare `docker run -d` container stays up |
 | `TOOLBOX_BAO_ROLES` | `editor,reader` | OpenBao roles tried at login, in order |
 | `TOOLBOX_BAO_AUTH_PATH` | `jwt` | OpenBao auth mount the CLI logs in through |
+| `TOOLBOX_ENABLE_OBSERVABILITY` | — | `1` switches `promtool`/`logcli`/`tempo-cli`/`grafana-ds` back on. Beta, unsupported, at your own risk; set on `up` from a terminal — ignored when an agent runs `up`. See [Beta and risk acceptance](#beta-and-risk-acceptance). |
 
 ## How it works
 
@@ -227,9 +276,10 @@ settings make them hold for everyone:
 
 ## Known risks
 
-Everything below is **known and accepted**, not a bug report. It is written down
-because the capabilities are wider than the commands imply, and nothing in the
-platform currently constrains them.
+Everything below is **known**, not a bug report, and by using the toolbox you
+accept it (see [Beta and risk acceptance](#beta-and-risk-acceptance)). It is
+written down because the capabilities are wider than the commands imply, and
+nothing in the platform currently constrains them.
 
 **Your token can write to the observability datasources, not just read them.**
 Grafana's datasource proxy is a full pass-through: it forwards `POST`, `PUT` and
@@ -264,6 +314,10 @@ Traefik router rule matching `Method(`GET`)` on `/api/datasources/proxy/` would
 make the read-only intent real. It is deliberately not done today.
 
 ## Known issues
+
+**The observability CLIs are switched off during the beta.** `promtool`,
+`logcli`, `tempo-cli` and `grafana-ds` have known issues and exit 5 with a
+refusal. See [Beta and risk acceptance](#beta-and-risk-acceptance).
 
 **An ArgoCD permission error can look like a login problem.** The `argocd` CLI
 speaks gRPC-web over root paths (`/application.ApplicationService/List` and

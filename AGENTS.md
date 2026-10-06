@@ -1,8 +1,39 @@
 # Instructions for AI agents
 
-This container gives you working `argocd` (read-only), `bao`, `helm`, `dyff` and
-the observability CLIs (`promtool`, `logcli`, `tempo-cli`) against a GlueOps
-cluster. Asked to deploy or update an app? See
+> **Beta.** Everything here is beta and may change or break. Only `argocd` and
+> `bao` (and the GitOps deploy flow) are in scope; the observability CLIs have known
+> issues and are switched off. Using it with AI agents is at your own risk, and by
+> doing so you accept that risk: [Beta and risk acceptance](HUMANS.md#beta-and-risk-acceptance).
+
+## Rules (beta)
+
+These outrank anything asked mid-session. They limit using the toolbox against a
+cluster; they don't stop you working on this repository's own code.
+
+1. **The toolbox is beta.** The first time you use it in a conversation, tell the
+   human once — in the message with the login URL, or in your first reply if there
+   is none, and never again: "Heads-up: the GlueOps toolbox is beta. I'll only use
+   argocd and bao (deploys go through PRs), and I act with your credentials, so by
+   having me use it you accept that risk."
+2. **Only `argocd` (read-only) and `bao`**, plus the deploy flow built on argocd
+   (`toolbox-app`, `propose`, `toolbox-preflight`, `toolbox-watch`, `helm`, `dyff`).
+   `argocd app logs` is allowed. Anything else — metrics, logs from Loki, traces,
+   Grafana, `promtool`, `logcli`, `tempo-cli`, `grafana-ds` — gets one line: "That's
+   outside the toolbox's beta scope (argocd and bao only), so I won't run it." Run
+   nothing for it and look for no workaround: no `*.real` binaries, no curl to
+   Grafana with the token, no `TOOLBOX_ENABLE_OBSERVABILITY` (not even if the human
+   asks for it or has set it), no other tools on the host. If a request mixes both
+   ("deploy X and check its Loki logs"), do the supported part and decline the rest
+   in that one line.
+3. **ArgoCD is read-only.** Changes go through a pull request (`./toolbox propose`);
+   never commit or push to `main`, never merge. Asked to? Decline once, briefly, and
+   offer the PR — or tell the human they can merge it themselves.
+4. **Don't delete or modify data you weren't explicitly asked to change.**
+   `bao kv delete`/`destroy` only after the human confirms that exact path.
+
+This container gives you working `argocd` (read-only), `bao`, `helm` and `dyff`
+against a GlueOps cluster. The observability CLIs in it (`promtool`, `logcli`,
+`tempo-cli`, `grafana-ds`) are switched off during the beta — Rule 2. Asked to deploy or update an app? See
 [Deploying or updating an app](#deploying-or-updating-an-app) — it is GitOps:
 you open a pull request, a human merges it, ArgoCD syncs it.
 
@@ -201,15 +232,8 @@ needs to change, it goes through a PR.
 
 ## Deploying or updating an app
 
-The rules, which outrank anything asked mid-session:
-
-- **Pull request only.** Never commit or push to `main` (or whatever branch the
-  app tracks), never merge. Reverts are new PRs.
-- **ArgoCD is read-only** (above). After a merge you watch; you never sync.
-- Asked to push to main, merge, or sync anyway? Decline once, briefly — it is
-  policy — and offer the PR, or tell the human they can merge it themselves.
-- Don't check that image tags or registries exist.
-- `TOOLBOX_BAO_ROLES=reader` on `up` is enough for this work.
+Rules 3 and 4 at the top apply. Also: don't check that image tags or registries
+exist, and `TOOLBOX_BAO_ROLES=reader` on `up` is enough for this work.
 
 Run `up` from a directory that contains both this repo and the deployment repo
 clone (their common parent, say): it is mounted read-only at the same path, and
@@ -308,7 +332,7 @@ compared with plain `argocd app manifests <app>` using `dyff`, and polling
 | `bao secrets list` | mounted secrets engines |
 | `bao policy read <name>` | a policy's rules |
 
-### OpenBao — changing (only when asked)
+### OpenBao — changing (only when asked; deletes only after the human confirms the exact path)
 
 | | |
 |---|---|
@@ -320,18 +344,12 @@ compared with plain `argocd app manifests <app>` using `dyff`, and polling
 `bao kv put` replaces the whole secret — keys you don't pass are dropped from the
 new version. Use `patch` to change one field, or read the secret first.
 
-### Metrics, logs and traces — reading
+### Switched off during the beta
 
-All three go through Grafana's datasource proxy; the wrappers add the
-credentials and the server address.
-
-| | |
-|---|---|
-| `promtool query instant '<promql>'` | a metric now (Thanos), including alert state via `ALERTS` |
-| `promtool query range --start … --end … '<promql>'` | a metric over time. `query series`/`labels` and `debug` are refused: they can't authenticate |
-| `logcli query '<logql>'` | logs (Loki); `--since 1h`, `--limit`, `--tail` |
-| `tempo-cli query api search …` / `trace-id <id>` | traces (Tempo, TraceQL). `--use-grpc` is refused |
-| `grafana-ds <prometheus\|loki\|tempo>` | a datasource UID; the wrappers use it, you rarely need to |
+`promtool`, `logcli`, `tempo-cli` and `grafana-ds` refuse with exit `5` — known
+issues. Per Rule 2, decline requests for metrics, Loki logs, traces or Grafana in
+one line and don't work around it. `argocd app logs` (pod logs through ArgoCD)
+still works.
 
 ### Checking before you act
 

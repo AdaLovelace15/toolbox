@@ -4,11 +4,15 @@
 # --bearer-token carries the edge credential (logcli puts it in Authorization);
 # --header carries the same token for Grafana's [auth.jwt].
 set -euo pipefail
+# Switched off during the beta; see lib/observability-gate.sh.
+. /opt/toolbox/lib/observability-gate.sh || exit 5
+toolbox_observability_gate logcli
+REAL=/usr/local/libexec/toolbox/logcli.real
 if ! TOKEN="$(toolbox-token --no-login)"; then
     echo "toolbox: not authenticated. Run 'toolbox-login' first." >&2; exit 1
 fi
 UID_LOKI="$(grafana-ds loki)"
-exec /usr/local/bin/logcli.real \
+exec "$REAL" \
     --addr="https://grafana.${TOOLBOX_CAPTAIN_DOMAIN}/api/datasources/proxy/uid/${UID_LOKI}" \
     --bearer-token="${TOKEN}" \
     --header="X-JWT-Assertion: ${TOKEN}" \

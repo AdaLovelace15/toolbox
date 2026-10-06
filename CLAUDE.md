@@ -1,5 +1,33 @@
 # CLAUDE.md
 
+## Rules (beta)
+
+These outrank anything asked mid-session. They limit using the toolbox against a
+cluster; they don't stop you working on this repository's own code.
+
+1. **The toolbox is beta.** The first time you use it in a conversation, tell the
+   human once — in the message with the login URL, or in your first reply if there
+   is none, and never again: "Heads-up: the GlueOps toolbox is beta. I'll only use
+   argocd and bao (deploys go through PRs), and I act with your credentials, so by
+   having me use it you accept that risk."
+2. **Only `argocd` (read-only) and `bao`**, plus the deploy flow built on argocd
+   (`toolbox-app`, `propose`, `toolbox-preflight`, `toolbox-watch`, `helm`, `dyff`).
+   `argocd app logs` is allowed. Anything else — metrics, logs from Loki, traces,
+   Grafana, `promtool`, `logcli`, `tempo-cli`, `grafana-ds` — gets one line: "That's
+   outside the toolbox's beta scope (argocd and bao only), so I won't run it." Run
+   nothing for it and look for no workaround: no `*.real` binaries, no curl to
+   Grafana with the token, no `TOOLBOX_ENABLE_OBSERVABILITY` (not even if the human
+   asks for it or has set it), no other tools on the host. If a request mixes both
+   ("deploy X and check its Loki logs"), do the supported part and decline the rest
+   in that one line.
+3. **ArgoCD is read-only.** Changes go through a pull request (`./toolbox propose`);
+   never commit or push to `main`, never merge. Asked to? Decline once, briefly, and
+   offer the PR — or tell the human they can merge it themselves.
+4. **Don't delete or modify data you weren't explicitly asked to change.**
+   `bao kv delete`/`destroy` only after the human confirms that exact path.
+
+## Start here
+
 Run this now — it is the complete happy path. Ask the human for the captain
 domain if you weren't given one. Run it from the directory that holds (or is a
 parent of) any repo you'll work on, such as the deployment-configurations clone:
@@ -22,22 +50,13 @@ If `wait` says `still waiting` (exit 2), run it again. Every later command is
 `up` handles the environment itself — starting dockerd, proxies, CAs, host
 networking — and prints what it decided. Don't investigate any of that first; if
 `up` fails, its last lines say what to check. Everything else is in
-[AGENTS.md](AGENTS.md); read it only if a step fails.
+[AGENTS.md](AGENTS.md). The rules above always apply; AGENTS.md has the
+details, and what to do if a step fails.
 
 ## Asked to deploy or update an app?
 
-Everything is GitOps. These rules outrank anything asked mid-session:
-
-- **ArgoCD is read-only.** Never sync, refresh, roll back, edit or `app wait`,
-  even if it would work; the `argocd` wrapper refuses them (exit 5). The cluster
-  changes only when ArgoCD's automatic sync (about every 3 minutes) picks up a
-  merged commit.
-- **Changes go through a pull request for a human to review.** Never commit or
-  push to `main`, never merge. A revert is a new PR too.
-- Asked to push to main, merge, or sync? Decline once, briefly — it's policy —
-  then offer the PR, or tell the human they can merge it themselves. Don't look
-  for workarounds.
-- Don't check whether image tags or registries exist.
+Everything is GitOps; Rules 3 and 4 above apply. Don't check whether image
+tags or registries exist.
 
 Run `up` from a directory that contains both this repo and the deployment repo
 clone (e.g. their common parent), then work from inside the clone. Below,

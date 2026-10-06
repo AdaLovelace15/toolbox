@@ -19,6 +19,10 @@
 #
 # Everything else (check, push, test, tsdb) is local and passed straight through.
 set -euo pipefail
+# Switched off during the beta; see lib/observability-gate.sh.
+. /opt/toolbox/lib/observability-gate.sh || exit 5
+toolbox_observability_gate promtool
+REAL=/usr/local/libexec/toolbox/promtool.real
 
 # Is any argument already a server URL? An explicit one always wins.
 has_server() {
@@ -32,7 +36,7 @@ has_server() {
 if [ "${1:-}" = "query" ]; then
     sub="${2:-}"
     # No subcommand, or asking for help: there is nothing to point at a server.
-    case "$sub" in ""|-*) exec /usr/local/bin/promtool.real "$@" ;; esac
+    case "$sub" in ""|-*) exec "$REAL" "$@" ;; esac
     shift 2
     case "$sub" in
         instant|range)
@@ -41,13 +45,13 @@ if [ "${1:-}" = "query" ]; then
             fi
             hdrs=(--header "Authorization: Bearer ${TOKEN}" --header "X-JWT-Assertion: ${TOKEN}")
             if has_server "$@"; then
-                exec /usr/local/bin/promtool.real query "$sub" "$@" "${hdrs[@]}"
+                exec "$REAL" query "$sub" "$@" "${hdrs[@]}"
             fi
             server="https://grafana.${TOOLBOX_CAPTAIN_DOMAIN}/api/datasources/proxy/uid/$(grafana-ds prometheus)"
-            exec /usr/local/bin/promtool.real query "$sub" "$server" "$@" "${hdrs[@]}"
+            exec "$REAL" query "$sub" "$server" "$@" "${hdrs[@]}"
             ;;
         *)
-            has_server "$@" && exec /usr/local/bin/promtool.real query "$sub" "$@"
+            has_server "$@" && exec "$REAL" query "$sub" "$@"
             echo "toolbox: 'promtool query $sub' takes no --header, so it cannot authenticate to this cluster. Use 'query instant' or 'query range' (labels are also available as 'logcli labels'), or pass an explicit server." >&2
             exit 1
             ;;
@@ -55,9 +59,9 @@ if [ "${1:-}" = "query" ]; then
 fi
 
 if [ "${1:-}" = "debug" ]; then
-    has_server "${@:2}" && exec /usr/local/bin/promtool.real "$@"
+    has_server "${@:2}" && exec "$REAL" "$@"
     echo "toolbox: 'promtool debug' takes no --header, so it cannot authenticate to this cluster. Pass an explicit server to use it against something else." >&2
     exit 1
 fi
 
-exec /usr/local/bin/promtool.real "$@"
+exec "$REAL" "$@"
