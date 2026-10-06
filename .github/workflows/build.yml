@@ -74,3 +74,11 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           docker run --rm -v "$PWD/tests:/tests:ro" --entrypoint bash toolbox:ci /tests/argocd-guard.sh
+
+      # The deploy helpers' logic (source positions, diffs, watch states, PR
+      # naming) against fakes - no server, no network.
+      - name: Unit tests
+        if: github.event_name == 'pull_request'
+        run: |
+          docker run --rm -v "$PWD/tests:/tests:ro" --entrypoint python3 toolbox:ci \
+            -m unittest discover -s /tests -p 'test_*.py' -v

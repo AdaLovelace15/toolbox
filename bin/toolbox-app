@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Where an ArgoCD app's config lives: chart, deployment repo, value files in override order, the file and line that sets image.tag, and what is running. Read-only.
+
+    toolbox-app --help
+"""
+import sys
+
+sys.path.insert(0, "/opt/toolbox/lib")
+import toolbox_deploy  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(toolbox_deploy.main_app(sys.argv[1:]))

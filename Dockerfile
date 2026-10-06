@@ -113,6 +113,8 @@ RUN chmod +x /usr/local/bin/toolbox-token /usr/local/bin/toolbox-proxy \
              /usr/local/bin/toolbox-login /usr/local/bin/argocd \
              /usr/local/bin/promtool /usr/local/bin/logcli \
              /usr/local/bin/tempo-cli /usr/local/bin/grafana-ds \
+             /usr/local/bin/toolbox-app /usr/local/bin/toolbox-preflight \
+             /usr/local/bin/toolbox-watch /usr/local/bin/toolbox-propose \
              /usr/local/bin/entrypoint.sh
 
 # Unprivileged, with the token-cache directory created up front and owned by the

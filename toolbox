@@ -7,6 +7,9 @@
 #   toolbox shell                 interactive shell in the container
 #   toolbox status                is it running, is it logged in
 #   toolbox down                  remove the container (the login cache volume is kept)
+#   toolbox propose -m <intent>   commit the deployment repo change on a branch, have
+#                                 ArgoCD render it, open a PR, stop (never main, never merge)
+#   toolbox propose --revert <sha>  the same, reverting a merged change
 #
 # The directory `up` runs in (or TOOLBOX_WORKDIR) is mounted read-only at the
 # same path, and commands start in your current directory, so helm can render a
@@ -30,7 +33,7 @@ log() { printf 'toolbox: %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
 
 usage() {
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit "${1:-1}"
 }
 
@@ -300,6 +303,107 @@ cmd_exec() {
     return "$rc"
 }
 
+# ----------------------------------------------------------------- propose --
+# git and gh run here, on the host, with the human's credentials; the container
+# (which sees the clone through the read-only mount) works out the branch name,
+# the affected ArgoCD apps and the PR body, and has ArgoCD render the pushed
+# branch. The one rule this enforces: nothing is ever committed to, pushed to or
+# merged into the branch the apps track.
+
+# Next free branch name: name, name-2, name-3...
+free_branch() {
+    local repo=$1 want=$2 b=$2 n=1
+    while git -C "$repo" show-ref --verify --quiet "refs/heads/$b" \
+          || git -C "$repo" ls-remote --exit-code --heads origin "$b" >/dev/null 2>&1; do
+        n=$((n + 1)); b="$want-$n"
+    done
+    printf '%s' "$b"
+}
+
+# Push, have the container write the body (running preflight per app), open the PR.
+propose_publish() {  # repo repo_p base branch title intent [revert-sha]
+    local repo=$1 repo_p=$2 base=$3 branch=$4 title=$5 intent=$6 revert=${7:-}
+    local sha body rc=0 url
+    [ "$branch" != "$base" ] || die "refusing to push to $base"
+    git -C "$repo" push -q -u origin "$branch" || die "git push failed"
+    sha=$(git -C "$repo" rev-parse HEAD)
+    body=$(cmd_exec toolbox-propose body --repo-root "$repo_p" --base "origin/$base" \
+               --rev "$sha" -m "$intent" ${revert:+--revert-of "$revert"}) || rc=$?
+    case "$rc" in
+        1) ;;
+        0) log "ArgoCD renders no change for any app: branch $branch is pushed, no PR opened"; return 0 ;;
+        *) log "preflight failed (see above): branch $branch is pushed, no PR opened"; return 2 ;;
+    esac
+    url=$(cd "$repo" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$body") \
+        || die "gh pr create failed; branch $branch is pushed"
+    printf '%s\n' "$url"
+    log "next: give the human that link and stop. Nothing deploys until they merge it; then: ./toolbox toolbox-watch <app> --rev <merge-sha>"
+}
+
+cmd_propose() {
+    local dir=. intent="" revert=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -m|--message) [ $# -ge 2 ] || die "propose: -m needs a value"; intent=$2; shift 2 ;;
+            --repo)       [ $# -ge 2 ] || die "propose: --repo needs a value"; dir=$2; shift 2 ;;
+            --revert)     [ $# -ge 2 ] || die "propose: --revert needs a commit"; revert=$2; shift 2 ;;
+            *) die "usage: toolbox propose -m <intent> [--repo DIR] | toolbox propose --revert <merge-sha> [-m <reason>] [--repo DIR]" ;;
+        esac
+    done
+    command -v gh >/dev/null 2>&1 || die "propose needs the GitHub CLI (gh) on this host"
+    gh auth status >/dev/null 2>&1 || die "gh is not logged in: gh auth login"
+    local repo repo_p base
+    repo=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) \
+        || die "$dir is not in a git repository; cd into the deployment repo clone or pass --repo"
+    repo_p=$(cd "$repo" && pwd -P)
+    is_inside "$repo_p" "$(container_workdir)" \
+        || die "$repo_p is outside the toolbox's mounted workdir ($(container_workdir)); run ./toolbox up from a directory that contains it"
+    base=$(git -C "$repo" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    base=${base#origin/}; base=${base:-main}
+    git -C "$repo" fetch -q origin "$base" || die "git fetch origin $base failed"
+
+    if [ -n "$revert" ]; then
+        local sha subject branch m=()
+        sha=$(git -C "$repo" rev-parse --verify --quiet "$revert^{commit}") || die "unknown commit $revert"
+        git -C "$repo" merge-base --is-ancestor "$sha" "origin/$base" || die "$revert is not on $base"
+        [ -z "$(git -C "$repo" status --porcelain)" ] || die "the working tree has changes; commit or stash them first"
+        branch=$(free_branch "$repo" "revert/$(git -C "$repo" rev-parse --short "$sha")")
+        git -C "$repo" switch -q -c "$branch" "origin/$base"
+        # A merge commit needs a mainline; the PR's merge is reverted against its first parent.
+        [ "$(git -C "$repo" rev-list --parents -n1 "$sha" | wc -w)" -gt 2 ] && m=(-m 1)
+        if ! git -C "$repo" revert --no-edit ${m[@]+"${m[@]}"} "$sha" >/dev/null; then
+            git -C "$repo" revert --abort >/dev/null 2>&1 || true
+            die "git revert of $revert conflicts; resolve it by hand on a branch"
+        fi
+        subject=$(git -C "$repo" log -1 --format=%s)
+        propose_publish "$repo" "$repo_p" "$base" "$branch" "$subject" "${intent:-Reverts $sha.}" "$sha"
+        return
+    fi
+
+    [ -n "$intent" ] || die "propose: say what the change is for: -m \"<intent>\""
+    local cur plan branch="" title="" k v
+    cur=$(git -C "$repo" symbolic-ref --short HEAD 2>/dev/null) || die "detached HEAD; check out a branch first"
+    plan=$(cmd_exec toolbox-propose plan --repo-root "$repo_p" --base "origin/$base" \
+               --branch "$cur" -m "$intent") || exit 2
+    while IFS='=' read -r k v; do
+        case "$k" in branch) branch=$v ;; title) title=$v ;; apps) log "affected: $v" ;; esac
+    done <<< "$plan"
+    [ -n "$branch" ] && [ -n "$title" ] || die "could not work out a branch and title"
+
+    if [ "$cur" = "$base" ]; then
+        branch=$(free_branch "$repo" "$branch")
+        git -C "$repo" switch -q -c "$branch"
+    else
+        branch=$cur
+    fi
+    if [ -n "$(git -C "$repo" status --porcelain)" ]; then
+        git -C "$repo" add -A
+        git -C "$repo" commit -q -m "$title"
+    fi
+    [ "$(git -C "$repo" rev-list --count "origin/$base..HEAD")" -gt 0 ] || die "nothing to propose: $branch has no commits beyond $base"
+    propose_publish "$repo" "$repo_p" "$base" "$branch" "$title" "$intent"
+}
+
 cmd_status() {
     local st
     st=$(docker inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo "absent")
@@ -320,6 +424,7 @@ case "${1:-}" in
     wait)    cmd_wait ;;
     shell)   docker exec -it "$NAME" bash -lc 'cd "$1" 2>/dev/null; exec bash -l' bash "$(pwd -P)" ;;
     status)  cmd_status ;;
+    propose) shift; cmd_propose "$@" ;;
     down)    docker rm -f "$NAME" >/dev/null 2>&1 && log "removed $NAME (volume $VOLUME kept)" ;;
     -h|--help|help|"") usage 0 ;;
     *)       cmd_exec "$@" ;;
